@@ -335,8 +335,6 @@ function handleFind(guildId: string, keyword: string): string {
   const snippet = session.paragraphs[targetIndex].slice(0, 60);
   return `🔍 Found match at paragraph **${targetIndex + 1}** of ${session.paragraphs.length}!\nJumping to: *"${snippet}..."*`;
 }
-  );
-}
 
 function handleChapter(guildId: string, num: number): string {
   const result = skipToChapter(guildId, num);
