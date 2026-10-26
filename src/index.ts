@@ -311,8 +311,30 @@ function handleProgress(guildId: string): string {
   return (
     `📖 **${info.title}**\n` +
     `${buildProgressBar(pct)} ${pct}%\n` +
-    `Chunk ${info.index}/${info.total}` +
+    `📍 **Position:** Paragraph ${info.index} of ${info.total}` +
     (info.paused ? " *(paused)*" : "")
+  );
+}
+
+function handleFind(guildId: string, keyword: string): string {
+  const session = getSession(guildId);
+  if (!session || !session.paragraphs) return "❌ Nothing is currently playing.";
+
+  const query = keyword.toLowerCase().trim();
+  if (!query) return "❌ Please provide a keyword to search for.";
+
+  const targetIndex = session.paragraphs.findIndex((para: string) => 
+    para.toLowerCase().includes(query)
+  );
+
+  if (targetIndex === -1) {
+    return `❌ Could not find any paragraphs containing "${keyword}".`;
+  }
+
+  session.index = targetIndex;
+  const snippet = session.paragraphs[targetIndex].slice(0, 60);
+  return `🔍 Found match at paragraph **${targetIndex + 1}** of ${session.paragraphs.length}!\nJumping to: *"${snippet}..."*`;
+}
   );
 }
 
