@@ -1,6 +1,5 @@
 import axios from "axios";
 import * as cheerio from "cheerio";
-import { AnyNode, Element } from 'domhandler';
 
 export interface ChapterSection {
   title: string;
@@ -78,7 +77,7 @@ interface ExtractResult {
 
 function extractParagraphs(
   $: cheerio.CheerioAPI,
-  contentEl: cheerio.Cheerio<cheerio.AnyNode>,
+  contentEl: cheerio.Cheerio<any>,
   opts: { hrAsSceneBreak: boolean; includeListItems?: boolean } = { hrAsSceneBreak: true },
 ): ExtractResult {
   const paragraphs: string[] = [];
@@ -86,7 +85,7 @@ function extractParagraphs(
   let partCounter = 0;
 
   contentEl.find(opts.includeListItems ? "p, li, h1, h2, h3, h4, h5, h6, hr" : "p, h1, h2, h3, h4, h5, h6, hr").each((_, el) => {
-    const tag = (el as cheerio.Element).tagName?.toLowerCase() ?? "";
+    const tag = (el as any).tagName?.toLowerCase() ?? "";
     if (SKIP_TAGS.has(tag)) return;
 
     // Horizontal rule — only treat as scene break on non-AO3 sites
