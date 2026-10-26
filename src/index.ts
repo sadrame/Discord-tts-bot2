@@ -498,7 +498,7 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
       }
       case "find": {
         const kw = cmd.options.getString("keyword", true);
-        await editReply(handleFind(interaction.guildID!, kw));
+        await editReply(handleFind(interaction.guildId!, kw));
         break;
       }
       case "stop":     await editReply(await handleStop(guildId)); break;
