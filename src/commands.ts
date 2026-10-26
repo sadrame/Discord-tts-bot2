@@ -26,4 +26,5 @@ export const slashCommands = [
   new SlashCommandBuilder().setName("voice").setDescription("Pick a TTS voice"),
   new SlashCommandBuilder().setName("invite").setDescription("Get a link to add this bot to your server"),
   new SlashCommandBuilder().setName("help").setDescription("Show the command list"),
+  new SlashCommandBuilder().setName("join").setDescription("Makes the bot join your current voice channel"),
 ].map((c) => c.toJSON());
