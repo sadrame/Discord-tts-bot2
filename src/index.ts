@@ -317,7 +317,7 @@ function handleProgress(guildId: string): string {
 }
 
 function handleFind(guildId: string, keyword: string): string {
-  const session = getSession(guildId);
+  const session = getSession(guildId) as any;
   if (!session || !session.paragraphs) return "❌ Nothing is currently playing.";
 
   const query = keyword.toLowerCase().trim();
