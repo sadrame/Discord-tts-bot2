@@ -1,5 +1,6 @@
 import axios from "axios";
 import * as cheerio from "cheerio";
+import { AnyNode, Element } from 'domhandler';
 
 export interface ChapterSection {
   title: string;
