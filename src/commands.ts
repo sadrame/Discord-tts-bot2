@@ -27,4 +27,12 @@ export const slashCommands = [
   new SlashCommandBuilder().setName("invite").setDescription("Get a link to add this bot to your server"),
   new SlashCommandBuilder().setName("help").setDescription("Show the command list"),
   new SlashCommandBuilder().setName("join").setDescription("Makes the bot join your current voice channel"),
+new SlashCommandBuilder()
+    .setName("find")
+    .setDescription("Search for a keyword in the chapter and jump directly to that paragraph")
+    .addStringOption((o) =>
+      o.setName("keyword")
+       .setDescription("The text or phrase you want to jump to")
+       .setRequired(true)
+    ),
 ].map((c) => c.toJSON());
