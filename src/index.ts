@@ -498,7 +498,7 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
       }
       case "find": {
         const kw = cmd.options.getString("keyword", true);
-        await editReply(handleFind(guildId, kw));
+        await editReply(handleFind(interaction.guildID!, kw));
         break;
       }
       case "stop":     await editReply(await handleStop(guildId)); break;
@@ -617,7 +617,11 @@ client.on(Events.MessageCreate, async (message: Message) => {
         );
         return;
       }
-
+case "find": {
+        const kw = args.join(" ");
+        reply = kw === "" ? "❌ Usage: `!find <keyword>`" : handleFind(message.guildId!, kw);
+        break;
+      }
 case "join": {
         if (!memberVC) {
           try { await message.reply("❌ You must be in a voice channel for me to join you!"); } catch {}
