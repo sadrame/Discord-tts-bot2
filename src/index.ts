@@ -500,7 +500,7 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
         const kw = cmd.options.getString("keyword", true);
         await editReply(handleFind(guildId, kw));
         break;
-      
+      }
       case "stop":     await editReply(await handleStop(guildId)); break;
       case "pause":    await editReply(handlePause(guildId));      break;
       case "resume":   await editReply(handleResume(guildId));     break;
