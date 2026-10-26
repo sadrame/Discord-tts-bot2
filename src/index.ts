@@ -463,6 +463,19 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
         );
         break;
       }
+      case "join": {
+        if (!memberVC) {
+          await editReply("❌ You must be in a voice channel for me to join you!");
+          return;
+        }
+        try {
+          await startReading(interaction.guild!, memberVC, textChannel, "Voice Check", [], "", [], 0, interaction.user.id);
+          await editReply(`Successfully joined **${memberVC.name}**!`);
+        } catch (err) {
+          await editReply(`❌ Voice error: ${(err as Error).message}`);
+        }
+        break;
+      }
       case "stop":     await editReply(await handleStop(guildId)); break;
       case "pause":    await editReply(handlePause(guildId));      break;
       case "resume":   await editReply(handleResume(guildId));     break;
