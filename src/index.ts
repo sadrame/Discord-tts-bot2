@@ -593,6 +593,19 @@ client.on(Events.MessageCreate, async (message: Message) => {
         return;
       }
 
+case "join": {
+        if (!memberVC) {
+          try { await message.reply("❌ You must be in a voice channel for me to join you!"); } catch {}
+          return;
+        }
+        try {
+          await startReading(message.guild!, memberVC, textChannel, "Voice Check", [], "", [], 0, message.author.id);
+          await message.reply(`Successfully joined **${memberVC.name}**!`);
+        } catch (err) {
+          try { await message.reply(`❌ Voice error: ${(err as Error).message}`); } catch {}
+        }
+        return;
+      }
       case "voice": {
         try {
           await message.reply({
