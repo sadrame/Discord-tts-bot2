@@ -8,10 +8,16 @@ export const slashCommands = [
     .addChannelOption((o) =>
       o.setName("channel").setDescription("Voice channel to join (defaults to yours)")
         .addChannelTypes(ChannelType.GuildVoice, ChannelType.GuildStageVoice)),
+  new SlashCommandBuilder().setName("join").setDescription("Join your current voice channel and wait"),
   new SlashCommandBuilder().setName("stop").setDescription("Stop reading and leave voice (saves your position)"),
   new SlashCommandBuilder().setName("pause").setDescription("Pause playback"),
   new SlashCommandBuilder().setName("resume").setDescription("Resume playback"),
-  new SlashCommandBuilder().setName("skip").setDescription("Skip current paragraph"),
+  new SlashCommandBuilder().setName("skip").setDescription("Skip to the next paragraph"),
+  new SlashCommandBuilder()
+    .setName("find")
+    .setDescription("Search the chapter (typo-tolerant) and jump to the match")
+    .addStringOption((o) =>
+      o.setName("keyword").setDescription("Word or phrase to jump to").setRequired(true)),
   new SlashCommandBuilder()
     .setName("chapter")
     .setDescription("Jump to chapter/section N")
@@ -26,13 +32,4 @@ export const slashCommands = [
   new SlashCommandBuilder().setName("voice").setDescription("Pick a TTS voice"),
   new SlashCommandBuilder().setName("invite").setDescription("Get a link to add this bot to your server"),
   new SlashCommandBuilder().setName("help").setDescription("Show the command list"),
-  new SlashCommandBuilder().setName("join").setDescription("Makes the bot join your current voice channel"),
-new SlashCommandBuilder()
-    .setName("find")
-    .setDescription("Search for a keyword in the chapter and jump directly to that paragraph")
-    .addStringOption((o) =>
-      o.setName("keyword")
-       .setDescription("The text or phrase you want to jump to")
-       .setRequired(true)
-    ),
 ].map((c) => c.toJSON());

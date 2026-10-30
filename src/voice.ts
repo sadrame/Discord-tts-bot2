@@ -27,15 +27,32 @@ import { DEFAULT_VOICE } from "./voices.js";
 import { saveBookmark, clearBookmark } from "./bookmarks.js";
 import type { ChapterSection } from "./scraper.js";
 
+// How long to wait for Discord's voice handshake. Render's free tier can be slow,
+// so the default is generous. Override with the VOICE_READY_TIMEOUT_MS env var.
+const VOICE_READY_TIMEOUT_MS = Number(process.env["VOICE_READY_TIMEOUT_MS"]) || 60_000;
+// /join leaves again after this long if nobody starts a reading
+const STANDBY_TIMEOUT_MS = 10 * 60_000;
+
 // ─── Session ──────────────────────────────────────────────────────────────────
+
+export interface SearchState {
+  query:   string;
+  matches: number[];   // paragraph indices
+  pos:     number;     // index into matches
+  fuzzy:   boolean;
+}
 
 export interface ReadSession {
   guildId:          string;
   userId:           string;         // who started the session (for DM control)
   title:            string;
   url:              string;
+  paragraphs:       string[];
+  paragraphStarts:  number[];       // first chunk index of every paragraph
   allChunks:        string[];
-  chunkIndex:       number;
+  chunkIndex:       number;         // next chunk to GENERATE
+  playingIdx:       number;         // chunk currently playing (what the user hears)
+  seekEpoch:        number;         // bumped on every seek so stale audio is discarded
   paused:           boolean;
   stopped:          boolean;
   voiceVersion:     number;
@@ -45,16 +62,18 @@ export interface ReadSession {
   progressMsg:      DjsMessage | null;
   lastProgressEdit: number;
 
-  // Wall-clock timing (accurate timer regardless of update frequency)
-  readingStartedAt: number;       // Date.now() when playback started/last resumed
-  pausedDuration:   number;       // accumulated ms spent paused
-  pauseStartedAt:   number | null;// set when we enter pause, null otherwise
+  // Wall-clock timing (rebased on every seek so the bar follows the position)
+  readingStartedAt: number;
+  pausedDuration:   number;
+  pauseStartedAt:   number | null;
 
   // Chapter navigation
   chapterBoundaries: number[];    // chunk indices where each chapter starts
-  chapterTitles:     string[];    // display name for each chapter
+  chapterTitles:     string[];
 
-  // Background progress timer
+  // Last /find results (for the prev/next match buttons)
+  search: SearchState | null;
+
   progressTimer: ReturnType<typeof setInterval> | null;
 }
 
@@ -62,12 +81,15 @@ interface ChunkResult {
   file:         string;
   chunkIdx:     number;
   voiceVersion: number;
+  epoch:        number;
 }
 
 const sessions    = new Map<string, ReadSession>();
 const guildVoices = new Map<string, VoiceOption>();
 // Reverse lookup: userId → guildId, so DM commands can find the active session
 const userToGuild = new Map<string, string>();
+// Guilds where the bot is sitting in a voice channel (via /join) without reading
+const standby     = new Map<string, ReturnType<typeof setTimeout>>();
 
 /** Find a session by the user who started it (used for DM control commands). */
 export function getSessionByUserId(userId: string): ReadSession | undefined {
@@ -93,6 +115,73 @@ export function setGuildVoice(guildId: string, voice: VoiceOption): void {
   console.log(`[voice] guild ${guildId} → ${voice.id}`);
 }
 
+// ─── Connection helpers ───────────────────────────────────────────────────────
+
+function destroyConnection(guildId: string): void {
+  const conn = getVoiceConnection(guildId);
+  if (conn && conn.state.status !== VoiceConnectionStatus.Destroyed) conn.destroy();
+}
+
+async function connectToChannel(guild: Guild, voiceChannel: VoiceBasedChannel): Promise<VoiceConnection> {
+  const connection = joinVoiceChannel({
+    channelId:      voiceChannel.id,
+    guildId:        guild.id,
+    adapterCreator: guild.voiceAdapterCreator,
+  });
+
+  try {
+    await entersState(connection, VoiceConnectionStatus.Ready, VOICE_READY_TIMEOUT_MS);
+  } catch {
+    if (connection.state.status !== VoiceConnectionStatus.Destroyed) connection.destroy();
+    throw new Error(`Could not connect to the voice channel within ${Math.round(VOICE_READY_TIMEOUT_MS / 1000)} seconds.`);
+  }
+
+  // Standard recovery pattern: if Discord moves/reconnects us, give it a few seconds
+  // before giving up. Only a real disconnect ends the session.
+  connection.on(VoiceConnectionStatus.Disconnected, async () => {
+    try {
+      await Promise.race([
+        entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
+        entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
+      ]);
+    } catch {
+      if (connection.state.status !== VoiceConnectionStatus.Destroyed) {
+        await stopSession(guild.id).catch(() => {});
+      }
+    }
+  });
+
+  return connection;
+}
+
+// ─── Standby (/join) ──────────────────────────────────────────────────────────
+
+function clearStandby(guildId: string): boolean {
+  const timer = standby.get(guildId);
+  if (!timer) return false;
+  clearTimeout(timer);
+  standby.delete(guildId);
+  return true;
+}
+
+/** Join a voice channel and wait there (leaves after 10 minutes if unused). */
+export async function joinStandby(guild: Guild, voiceChannel: VoiceBasedChannel): Promise<void> {
+  await stopSession(guild.id);
+  await connectToChannel(guild, voiceChannel);
+  const timer = setTimeout(() => {
+    standby.delete(guild.id);
+    destroyConnection(guild.id);
+  }, STANDBY_TIMEOUT_MS);
+  standby.set(guild.id, timer);
+}
+
+/** Leave a /join standby. Returns false if the bot wasn't in standby. */
+export function leaveStandby(guildId: string): boolean {
+  if (!clearStandby(guildId)) return false;
+  destroyConnection(guildId);
+  return true;
+}
+
 // ─── Session lifecycle ────────────────────────────────────────────────────────
 
 export function getSession(guildId: string): ReadSession | undefined {
@@ -100,9 +189,9 @@ export function getSession(guildId: string): ReadSession | undefined {
 }
 
 export async function stopSession(guildId: string): Promise<void> {
+  clearStandby(guildId);
   const session = sessions.get(guildId);
   if (session) {
-    // Stop background timer
     if (session.progressTimer) {
       clearInterval(session.progressTimer);
       session.progressTimer = null;
@@ -110,18 +199,20 @@ export async function stopSession(guildId: string): Promise<void> {
     session.stopped = true;
     session.player.stop(true);
     userToGuild.delete(session.userId);
-    if (session.chunkIndex > 0 && session.chunkIndex < session.allChunks.length) {
+    // Save where the listener actually is (not where audio generation has got to).
+    // Natural end of the chapter (chunkIndex === length) never saves a bookmark.
+    if (session.playingIdx > 0 && session.chunkIndex < session.allChunks.length) {
       await saveBookmark(
         guildId,
         session.url,
-        session.chunkIndex,
+        session.playingIdx,
         session.allChunks.length,
         session.title,
       ).catch(() => {});
     }
   }
   sessions.delete(guildId);
-  getVoiceConnection(guildId)?.destroy();
+  destroyConnection(guildId);
 }
 
 export async function startReading(
@@ -135,19 +226,21 @@ export async function startReading(
   resumeFromChunk  = 0,
   userId           = "",
 ): Promise<void> {
+  if (paragraphs.length === 0) throw new Error("There is nothing to read.");
   await stopSession(guild.id);
 
   // Build chunks and map paragraph → first chunk index (for chapter boundaries)
   const allChunks: string[] = [];
-  const paraToChunkStart: number[] = [];
+  const paragraphStarts: number[] = [];
   for (const para of paragraphs) {
-    paraToChunkStart.push(allChunks.length);
+    paragraphStarts.push(allChunks.length);
     allChunks.push(...splitIntoChunks(para));
   }
+  const startChunk = Math.max(0, Math.min(resumeFromChunk, Math.max(0, allChunks.length - 1)));
 
   // Convert section paragraph indices to chunk indices
   const chapterBoundaries: number[] = sections.map(
-    (s) => paraToChunkStart[s.startParagraph] ?? 0
+    (s) => paragraphStarts[s.startParagraph] ?? 0
   );
   const chapterTitles: string[] = sections.map((s) => s.title);
 
@@ -176,8 +269,12 @@ export async function startReading(
     userId,
     title,
     url,
+    paragraphs,
+    paragraphStarts,
     allChunks,
-    chunkIndex:       resumeFromChunk,
+    chunkIndex:       startChunk,
+    playingIdx:       startChunk,
+    seekEpoch:        0,
     paused:           false,
     stopped:          false,
     voiceVersion:     0,
@@ -186,11 +283,12 @@ export async function startReading(
     textChannel,
     progressMsg:      null,
     lastProgressEdit: 0,
-    readingStartedAt: now,
+    readingStartedAt: now - currentChunkEstimatedSec(allChunks, startChunk) * 1000,
     pausedDuration:   0,
     pauseStartedAt:   null,
     chapterBoundaries: dedupBounds,
     chapterTitles:    dedupTitles,
+    search:           null,
     progressTimer:    null,
   };
 
@@ -204,7 +302,7 @@ export async function startReading(
     );
   } catch { /* non-fatal */ }
 
-  // Start 5-second background timer for accurate wall-clock updates
+  // 5-second background timer for accurate wall-clock updates
   session.progressTimer = setInterval(() => {
     const s = sessions.get(guild.id);
     if (!s || s.stopped) return;
@@ -212,27 +310,26 @@ export async function startReading(
     updateProgress(s).catch(() => {});
   }, 5_000);
 
-  const connection = joinVoiceChannel({
-    channelId:       voiceChannel.id,
-    guildId:         guild.id,
-    adapterCreator:  guild.voiceAdapterCreator,
-  });
-
+  let connection: VoiceConnection;
   try {
-    await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
-  } catch {
+    connection = await connectToChannel(guild, voiceChannel);
+  } catch (err) {
     await stopSession(guild.id);
-    throw new Error("Could not connect to the voice channel within 15 seconds.");
+    throw err;
+  }
+  // The user may have run /stop (or started something else) while we were connecting
+  if (session.stopped || sessions.get(guild.id) !== session) {
+    destroyConnection(guild.id);
+    return;
   }
 
   connection.subscribe(player);
-  connection.on(VoiceConnectionStatus.Disconnected, () => stopSession(guild.id));
 
   // Show the live embed with buttons immediately — don't wait for first TTS chunk
   session.lastProgressEdit = 0;
   await updateProgress(session).catch(() => {});
 
-  runPipeline(session, connection).catch((err) =>
+  runPipeline(session).catch((err) =>
     console.error("[pipeline] uncaught:", err)
   );
 }
@@ -277,14 +374,28 @@ function fmt(sec: number): string {
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
-// ─── Chapter helpers ──────────────────────────────────────────────────────────
+// ─── Paragraph / chapter helpers ──────────────────────────────────────────────
+
+/** Paragraph (0-based) that contains the given chunk. */
+function paragraphIndexOfChunk(session: ReadSession, chunk: number): number {
+  const starts = session.paragraphStarts;
+  let lo = 0;
+  let hi = starts.length - 1;
+  let ans = 0;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (starts[mid]! <= chunk) { ans = mid; lo = mid + 1; }
+    else hi = mid - 1;
+  }
+  return ans;
+}
 
 function getCurrentChapterIndex(session: ReadSession): number {
-  const { chapterBoundaries, chunkIndex } = session;
+  const { chapterBoundaries, playingIdx } = session;
   if (chapterBoundaries.length === 0) return 0;
   let ch = 0;
   for (let i = 0; i < chapterBoundaries.length; i++) {
-    if (chunkIndex >= chapterBoundaries[i]!) ch = i;
+    if (playingIdx >= chapterBoundaries[i]!) ch = i;
     else break;
   }
   return ch;
@@ -320,7 +431,7 @@ function buildEmbed(session: ReadSession, voice: VoiceOption, loading = false): 
   const pct      = total > 0 ? Math.min(1, elapsed / total) : 0;
   const filled   = Math.round(pct * BAR_WIDTH);
   const bar      = "▓".repeat(filled) + "░".repeat(BAR_WIDTH - filled);
-  const timeStr  = `**${fmt(elapsed)}** / ~${fmt(total)}`;
+  const timeStr  = `**${fmt(Math.min(elapsed, total))}** / ~${fmt(total)}`;
 
   const chIdx    = getCurrentChapterIndex(session);
   const chTitle  = session.chapterTitles[chIdx];
@@ -331,12 +442,16 @@ function buildEmbed(session: ReadSession, voice: VoiceOption, loading = false): 
 
   const color    = session.paused ? EMBED_COLOR_PAUSED : EMBED_COLOR_PLAYING;
   const statusLine = session.paused ? "⏸️ Paused" : "▶️ Playing";
+  const paraNo   = paragraphIndexOfChunk(session, session.playingIdx) + 1;
 
   const embed = new EmbedBuilder()
     .setColor(color)
     .setTitle(`📖 ${session.title}`)
     .setDescription(`${bar}\n${timeStr} · ${statusLine}`)
-    .addFields({ name: "🎙️ Voice", value: `${flag} ${voice.label}`, inline: true });
+    .addFields(
+      { name: "🎙️ Voice",     value: `${flag} ${voice.label}`,                       inline: true },
+      { name: "📍 Paragraph", value: `${paraNo} / ${session.paragraphs.length}`,     inline: true },
+    );
 
   if (chStr) embed.addFields({ name: "📑 Chapter", value: chStr, inline: true });
 
@@ -386,10 +501,10 @@ type ProgressPayload = {
 };
 
 function buildProgressPayload(session: ReadSession, voice: VoiceOption, loading = false): ProgressPayload {
-  const embed    = buildEmbed(session, voice, loading);
-  const finished = session.chunkIndex >= session.allChunks.length;
+  const embed = buildEmbed(session, voice, loading);
 
-  if (loading || finished) return { embeds: [embed], components: [] };
+  // Buttons stay until finalizeProgress() replaces the embed at the end of the chapter
+  if (loading) return { embeds: [embed], components: [] };
 
   const components: ActionRowBuilder<ButtonBuilder>[] = [buildControlRow(session.paused)];
   const chRow = buildChapterRow(session);
@@ -433,7 +548,7 @@ async function finalizeProgress(session: ReadSession, stopped = false): Promise<
     const embed = new EmbedBuilder()
       .setColor(EMBED_COLOR_STOPPED)
       .setTitle(`📖 ${session.title}`)
-      .setDescription(`${bar}\n⏹️ Stopped at **${fmt(elapsed)}** / ~${fmt(total)}`)
+      .setDescription(`${bar}\n⏹️ Stopped at **${fmt(Math.min(elapsed, total))}** / ~${fmt(total)}`)
       .addFields({ name: "🎙️ Voice", value: `${flag} ${voice.label}`, inline: true });
     try { await session.progressMsg.edit({ embeds: [embed], components: [] }); } catch { /* ignore */ }
     return;
@@ -449,41 +564,61 @@ async function finalizeProgress(session: ReadSession, stopped = false): Promise<
 
 // ─── Pipeline ────────────────────────────────────────────────────────────────
 
-async function runPipeline(session: ReadSession, connection: VoiceConnection): Promise<void> {
+/** Wait for the player to go idle. Unlike a fixed timeout this survives long pauses. */
+async function waitForIdle(session: ReadSession): Promise<void> {
+  while (!session.stopped) {
+    try {
+      await entersState(session.player, AudioPlayerStatus.Idle, 30_000);
+      return;
+    } catch { /* still playing or paused — keep waiting */ }
+  }
+}
+
+/** Throw away a pre-generated chunk, rewinding the generator unless a seek already moved it. */
+async function discardChunk(session: ReadSession, chunk: ChunkResult): Promise<void> {
+  if (chunk.epoch === session.seekEpoch) session.chunkIndex = chunk.chunkIdx;
+  await cleanupFile(chunk.file);
+}
+
+/** Make sure a pre-generated chunk is still valid (no seek / voice change since it was made). */
+async function validateChunk(session: ReadSession, chunk: ChunkResult | null): Promise<ChunkResult | null> {
+  if (!chunk) return null;
+  if (chunk.epoch !== session.seekEpoch || chunk.voiceVersion !== session.voiceVersion) {
+    await discardChunk(session, chunk);
+    return generateChunk(session);
+  }
+  return chunk;
+}
+
+async function runPipeline(session: ReadSession): Promise<void> {
   let next = await generateChunk(session);
   await updateProgress(session); // flip from "loading" to live progress
 
   while (next !== null && !session.stopped) {
     if (session.paused) {
-      await cleanupFile(next.file);
+      await discardChunk(session, next);
       while (session.paused && !session.stopped) await sleep(200);
       if (session.stopped) break;
       next = await generateChunk(session);
       continue;
     }
 
-    const current          = next;
-    const versionAtKickoff = session.voiceVersion;
-    const nextPromise      = generateChunk(session); // pre-generate while playing
+    const current     = next;
+    const nextPromise = generateChunk(session); // pre-generate while playing
 
+    session.playingIdx = current.chunkIdx;
     try {
       const resource = createAudioResource(current.file, { inputType: StreamType.Arbitrary });
       session.player.play(resource);
       await entersState(session.player, AudioPlayerStatus.Playing, 10_000);
-      await entersState(session.player, AudioPlayerStatus.Idle,    300_000);
+      await waitForIdle(session);
     } catch { /* player stopped — ok */ } finally {
       await cleanupFile(current.file);
     }
 
     await updateProgress(session);
 
-    const preGen = await nextPromise;
-    if (preGen && session.voiceVersion !== versionAtKickoff) {
-      await cleanupFile(preGen.file);
-      next = await generateChunk(session);
-    } else {
-      next = preGen;
-    }
+    next = await validateChunk(session, await nextPromise);
   }
 
   // Stop timer before finalizing
@@ -496,7 +631,7 @@ async function runPipeline(session: ReadSession, connection: VoiceConnection): P
 
   if (!session.stopped) {
     await clearBookmark(session.guildId).catch(() => {});
-    stopSession(session.guildId);
+    await stopSession(session.guildId);
   }
 }
 
@@ -506,11 +641,12 @@ const FALLBACK_THRESHOLD  = 3; // failures before switching to Jenny
 const MAX_CHUNK_ATTEMPTS  = 2; // attempts per chunk with the current voice before giving up on that chunk
 
 async function generateChunk(session: ReadSession): Promise<ChunkResult | null> {
-  while (session.chunkIndex < session.allChunks.length) {
+  outer: while (session.chunkIndex < session.allChunks.length) {
     if (session.stopped) return null;
 
     // Peek — do NOT advance until we have a successful file
     const chunkIdx = session.chunkIndex;
+    const epoch    = session.seekEpoch;
     const text     = session.allChunks[chunkIdx]!;
     let localFails = 0;
 
@@ -522,9 +658,17 @@ async function generateChunk(session: ReadSession): Promise<ChunkResult | null> 
 
       try {
         const file = await textToMp3File(text, voice);
+
+        // A seek happened while this chunk was being generated → it's stale, start over
+        if (session.stopped || session.seekEpoch !== epoch) {
+          await cleanupFile(file);
+          if (session.stopped) return null;
+          continue outer;
+        }
+
         session.chunkIndex++;          // advance only on success
         session.consecutiveSkips = 0;
-        return { file, chunkIdx, voiceVersion: capturedVersion };
+        return { file, chunkIdx, voiceVersion: capturedVersion, epoch };
       } catch (err) {
         localFails++;
         session.consecutiveSkips++;
@@ -545,9 +689,9 @@ async function generateChunk(session: ReadSession): Promise<ChunkResult | null> 
       }
     }
 
-    // Exhausted attempts on this chunk — skip it and move on
+    // Exhausted attempts on this chunk — skip it and move on (unless a seek moved us)
     console.warn(`[generateChunk] skipping chunk ${chunkIdx} after ${MAX_CHUNK_ATTEMPTS} failed attempts`);
-    session.chunkIndex++;
+    if (session.seekEpoch === epoch) session.chunkIndex++;
     session.consecutiveSkips = 0;
   }
   return null;
@@ -576,21 +720,41 @@ export function resumeSession(guildId: string): boolean {
   return true;
 }
 
+/** Move playback to a chunk (0..length; length = end of chapter) and re-sync the timer. */
+function jumpToChunk(session: ReadSession, chunk: number): void {
+  const total   = session.allChunks.length;
+  const target  = Math.max(0, Math.min(chunk, total));
+  const now     = Date.now();
+
+  session.chunkIndex       = target;
+  session.playingIdx       = Math.min(target, Math.max(0, total - 1));
+  session.seekEpoch++;
+  session.voiceVersion++;
+  session.consecutiveSkips = 0;
+
+  // Rebase the clock so the bar and timestamps follow the new position
+  session.readingStartedAt = now - currentChunkEstimatedSec(session.allChunks, target) * 1000;
+  session.pausedDuration   = 0;
+  session.pauseStartedAt   = session.paused ? now : null;
+
+  session.player.stop();
+}
+
 export function skipParagraph(guildId: string): boolean {
   const session = sessions.get(guildId);
   if (!session) return false;
-  session.chunkIndex = Math.min(session.chunkIndex + 10, session.allChunks.length);
-  session.player.stop();
+  const nextPara = paragraphIndexOfChunk(session, session.playingIdx) + 1;
+  const target   = nextPara < session.paragraphStarts.length
+    ? session.paragraphStarts[nextPara]!
+    : session.allChunks.length;           // last paragraph → finish the chapter
+  jumpToChunk(session, target);
   return true;
 }
 
 export function seekSession(guildId: string, chunkIndex: number): boolean {
   const session = sessions.get(guildId);
   if (!session) return false;
-  session.chunkIndex       = Math.max(0, Math.min(chunkIndex, session.allChunks.length - 1));
-  session.voiceVersion++;
-  session.consecutiveSkips = 0;
-  session.player.stop();
+  jumpToChunk(session, Math.min(chunkIndex, Math.max(0, session.allChunks.length - 1)));
   return true;
 }
 
@@ -603,8 +767,7 @@ export function seekSessionBySeconds(guildId: string, targetSec: number): boolea
 export function seekRelativeSeconds(guildId: string, deltaSec: number): boolean {
   const session = sessions.get(guildId);
   if (!session) return false;
-  const current = currentChunkEstimatedSec(session.allChunks, session.chunkIndex);
-  return seekSessionBySeconds(guildId, current + deltaSec);
+  return seekSessionBySeconds(guildId, getElapsedSeconds(session) + deltaSec);
 }
 
 export function restartSession(guildId: string): boolean {
@@ -625,10 +788,48 @@ export function skipToChapter(guildId: string, chapterNum: number): { ok: boolea
   };
 }
 
+// ─── Paragraph navigation & search state (/find) ──────────────────────────────
+
+export function getParagraphs(guildId: string): string[] | null {
+  return sessions.get(guildId)?.paragraphs ?? null;
+}
+
+/** 0-based paragraph the listener is currently on. */
+export function getCurrentParagraphIndex(guildId: string): number | null {
+  const session = sessions.get(guildId);
+  return session ? paragraphIndexOfChunk(session, session.playingIdx) : null;
+}
+
+export function seekToParagraph(guildId: string, paragraphIdx: number): boolean {
+  const session = sessions.get(guildId);
+  if (!session) return false;
+  const start = session.paragraphStarts[paragraphIdx];
+  if (start === undefined) return false;
+  jumpToChunk(session, start);
+  return true;
+}
+
+export function setSearchState(guildId: string, state: SearchState | null): void {
+  const session = sessions.get(guildId);
+  if (session) session.search = state;
+}
+
+export function getSearchState(guildId: string): SearchState | null {
+  return sessions.get(guildId)?.search ?? null;
+}
+
+// ─── Info getters ─────────────────────────────────────────────────────────────
+
+/** Position in PARAGRAPHS (1-based) — what users actually care about. */
 export function getProgressInfo(guildId: string): { index: number; total: number; title: string; paused: boolean } | null {
   const session = sessions.get(guildId);
   if (!session) return null;
-  return { index: session.chunkIndex, total: session.allChunks.length, title: session.title, paused: session.paused };
+  return {
+    index:  paragraphIndexOfChunk(session, session.playingIdx) + 1,
+    total:  session.paragraphs.length,
+    title:  session.title,
+    paused: session.paused,
+  };
 }
 
 export function getProgressSeconds(guildId: string): { currentSec: number; totalSec: number; title: string } | null {

@@ -1,7 +1,10 @@
+import { createServer } from "http";
 import {
   Client,
   Events,
   GatewayIntentBits,
+  Partials,
+  MessageFlags,
   Message,
   GuildMember,
   TextChannel,
@@ -11,6 +14,8 @@ import {
   REST,
   Routes,
   ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
   StringSelectMenuBuilder,
   StringSelectMenuInteraction,
   ComponentType,
@@ -38,10 +43,18 @@ import {
   getChapterInfo,
   getGuildVoice,
   setGuildVoice,
+  joinStandby,
+  leaveStandby,
+  getParagraphs,
+  getCurrentParagraphIndex,
+  seekToParagraph,
+  setSearchState,
+  getSearchState,
 } from "./voice.js";
 import { getBookmark } from "./bookmarks.js";
 import { VOICES } from "./voices.js";
 import { slashCommands } from "./commands.js";
+import { searchParagraphs, pickStartPosition, snippetFor } from "./search.js";
 
 const PREFIX = "!";
 
@@ -68,10 +81,12 @@ function helpText(): string {
     "📖 **WCT Reader Bot**",
     "",
     "`/read <url> [channel]` — fetch a chapter and read it aloud",
+    "`/join` — join your voice channel and wait",
     "`/stop` — stop reading and leave voice (saves your position)",
     "`/pause` — pause playback",
     "`/resume` — resume playback",
-    "`/skip` — skip current paragraph",
+    "`/skip` — skip to the next paragraph",
+    "`/find <text>` — search the chapter (typo-tolerant) and jump to it; use ⬅️ ➡️ to cycle matches",
     "`/chapter <n>` — jump to chapter/section N",
     "`/chapters` — list all detected chapters in the current reading",
     "`/restart` — restart the chapter from the beginning",
@@ -142,6 +157,7 @@ async function sendVoicePicker(
 async function pickVoiceChannel(
   guild: Guild,
   textChannel: TextChannel,
+  userId: string,
   replyFn: (payload: { content: string; components: ActionRowBuilder<StringSelectMenuBuilder>[] }) => Promise<Message | void>
 ): Promise<VoiceBasedChannel | null> {
   const vcs = guild.channels.cache.filter(
@@ -169,7 +185,8 @@ async function pickVoiceChannel(
   try {
     const collected = await textChannel.awaitMessageComponent({
       componentType: ComponentType.StringSelect,
-      filter: (i) => i.customId === "vc_pick",
+      // only the person who asked can answer the picker
+      filter: (i) => i.customId === "vc_pick" && i.user.id === userId,
       time: 30_000,
     });
     await collected.deferUpdate();
@@ -235,7 +252,7 @@ async function handleRead(
   } else if (memberVC) {
     voiceChannel = memberVC;
   } else {
-    voiceChannel = await pickVoiceChannel(guild, textChannel,
+    voiceChannel = await pickVoiceChannel(guild, textChannel, requestedBy.id,
       (p) => replyFn({ content: p.content, components: p.components })
     );
   }
@@ -259,7 +276,7 @@ async function handleRead(
       const pct = Math.round((bookmark.chunkIndex / bookmark.totalChunks) * 100);
       await safeSend(
         textChannel,
-        `📌 Resuming **${bookmark.title}** from where you left off — chunk ${bookmark.chunkIndex}/${bookmark.totalChunks} (${pct}% done).`
+        `📌 Resuming **${bookmark.title}** from where you left off (${pct}% done).`
       );
     }
   } catch { /* non-fatal */ }
@@ -286,10 +303,23 @@ async function handleRead(
   }
 }
 
+async function handleJoin(guild: Guild, memberVC: VoiceBasedChannel | null | undefined): Promise<string> {
+  if (!memberVC) return "❌ You must be in a voice channel for me to join you!";
+  try {
+    await joinStandby(guild, memberVC);
+    return `✅ Joined **${memberVC.name}**. Start something with \`/read <url>\` — I'll leave after 10 minutes if idle.`;
+  } catch (err) {
+    return `❌ Voice error: ${(err as Error).message}`;
+  }
+}
+
 async function handleStop(guildId: string): Promise<string> {
-  if (!getSession(guildId)) return "❌ Nothing is currently playing.";
-  await stopSession(guildId);
-  return "⏹️ Stopped and left the voice channel. Your position has been saved — read the same URL to resume.";
+  if (getSession(guildId)) {
+    await stopSession(guildId);
+    return "⏹️ Stopped and left the voice channel. Your position has been saved — read the same URL to resume.";
+  }
+  if (leaveStandby(guildId)) return "👋 Left the voice channel.";
+  return "❌ Nothing is currently playing.";
 }
 
 function handlePause(guildId: string): string {
@@ -301,7 +331,7 @@ function handleResume(guildId: string): string {
 }
 
 function handleSkip(guildId: string): string {
-  return skipParagraph(guildId) ? "⏭️ Skipping forward..." : "❌ Nothing is currently playing.";
+  return skipParagraph(guildId) ? "⏭️ Skipping to the next paragraph..." : "❌ Nothing is currently playing.";
 }
 
 function handleProgress(guildId: string): string {
@@ -316,24 +346,68 @@ function handleProgress(guildId: string): string {
   );
 }
 
-function handleFind(guildId: string, keyword: string): string {
-  const session = getSession(guildId) as any;
-  if (!session || !session.paragraphs) return "❌ Nothing is currently playing.";
+// ─── /find — typo-tolerant search with prev/next match buttons ────────────────
 
-  const query = keyword.toLowerCase().trim();
-  if (!query) return "❌ Please provide a keyword to search for.";
+interface FindReply {
+  content:    string;
+  components: ActionRowBuilder<ButtonBuilder>[];
+}
 
-  const targetIndex = session.paragraphs.findIndex((para: string) => 
-    para.toLowerCase().includes(query)
+function buildFindRow(): ActionRowBuilder<ButtonBuilder> {
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId("find_prev").setEmoji("⬅️").setLabel("Prev match").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("find_next").setEmoji("➡️").setLabel("Next match").setStyle(ButtonStyle.Secondary),
   );
+}
 
-  if (targetIndex === -1) {
-    return `❌ Could not find any paragraphs containing "${keyword}".`;
+function describeMatch(guildId: string, withButtons: boolean): FindReply {
+  const state      = getSearchState(guildId);
+  const paragraphs = getParagraphs(guildId);
+  if (!state || !paragraphs) return { content: "❌ That search has expired — run `/find` again.", components: [] };
+
+  const paraIdx = state.matches[state.pos]!;
+  const text    = paragraphs[paraIdx] ?? "";
+  const lines = [
+    `🔍 ${state.fuzzy ? "Closest match" : "Match"} **${state.pos + 1}/${state.matches.length}** for “${state.query}” — paragraph **${paraIdx + 1}** of ${paragraphs.length}`,
+    `*“${snippetFor(text, state.query)}”*`,
+  ];
+  if (state.fuzzy) lines.push("_No exact matches — showing similar spellings._");
+  return {
+    content:    lines.join("\n"),
+    components: withButtons && state.matches.length > 1 ? [buildFindRow()] : [],
+  };
+}
+
+function handleFind(guildId: string, query: string, withButtons: boolean): FindReply {
+  const fail = (content: string): FindReply => ({ content, components: [] });
+
+  const paragraphs = getParagraphs(guildId);
+  if (!paragraphs) return fail("❌ Nothing is currently playing — start a chapter with `/read` first.");
+
+  const q = query.trim();
+  if (!q) return fail("❌ Usage: `!find <text>`");
+  if (q.length > 100) return fail("❌ Search text is too long (max 100 characters).");
+
+  const result = searchParagraphs(paragraphs, q);
+  if (result.matches.length === 0) {
+    setSearchState(guildId, null);
+    return fail(`❌ No paragraphs matching “${q}”.`);
   }
 
-  session.index = targetIndex;
-  const snippet = session.paragraphs[targetIndex].slice(0, 60);
-  return `🔍 Found match at paragraph **${targetIndex + 1}** of ${session.paragraphs.length}!\nJumping to: *"${snippet}..."*`;
+  const current = getCurrentParagraphIndex(guildId) ?? 0;
+  const pos     = pickStartPosition(result.matches, current);
+  setSearchState(guildId, { query: q, matches: result.matches, pos, fuzzy: result.fuzzy });
+  seekToParagraph(guildId, result.matches[pos]!);
+  return describeMatch(guildId, withButtons);
+}
+
+function stepFind(guildId: string, delta: number): FindReply | null {
+  const state = getSearchState(guildId);
+  if (!state || state.matches.length === 0) return null;
+  const n = state.matches.length;
+  state.pos = (state.pos + delta + n) % n;
+  seekToParagraph(guildId, state.matches[state.pos]!);
+  return describeMatch(guildId, true);
 }
 
 function handleChapter(guildId: string, num: number): string {
@@ -384,7 +458,7 @@ const client = new Client({
     GatewayIntentBits.GuildVoiceStates,
     GatewayIntentBits.DirectMessages,
   ],
-  partials: ["CHANNEL" as any], // required to receive DM events
+  partials: [Partials.Channel], // required to receive DM events
 });
 
 // ─── Ready ────────────────────────────────────────────────────────────────────
@@ -402,16 +476,29 @@ client.once(Events.ClientReady, async (c) => {
   }
 });
 
-// ─── Interaction handler (slash commands + select menus) ──────────────────────
+// ─── Interaction handler (slash commands + buttons + select menus) ────────────
 
 client.on(Events.InteractionCreate, async (interaction: Interaction) => {
   if (!interaction.guild) return;
   const guildId = interaction.guild.id;
 
-  // ── Seek/restart/pause/stop control buttons on the progress bar ────────────
+  // ── Buttons ─────────────────────────────────────────────────────────────────
   if (interaction.isButton()) {
     const btn = interaction as ButtonInteraction;
     const { customId } = btn;
+
+    // /find prev / next match
+    if (customId === "find_prev" || customId === "find_next") {
+      const reply = stepFind(guildId, customId === "find_next" ? 1 : -1);
+      if (!reply) {
+        await btn.reply({ content: "❌ That search has expired — run `/find` again.", flags: MessageFlags.Ephemeral }).catch(() => {});
+        return;
+      }
+      await btn.update({ content: reply.content, components: reply.components }).catch(() => {});
+      return;
+    }
+
+    // Seek/restart/pause/stop/chapter control buttons on the progress bar
     const CTRL_IDS = ["ctrl_restart","ctrl_back","ctrl_forward","ctrl_pause","ctrl_stop","ctrl_prev_chapter","ctrl_next_chapter"];
     if (CTRL_IDS.includes(customId)) {
       await btn.deferUpdate().catch(() => {});
@@ -447,7 +534,7 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
     const sel = interaction as StringSelectMenuInteraction;
     const voiceId = sel.values[0]!;
     const picked = VOICES.find((v) => v.id === voiceId);
-    if (!picked) { await sel.reply({ content: "❌ Unknown voice.", ephemeral: true }).catch(() => {}); return; }
+    if (!picked) { await sel.reply({ content: "❌ Unknown voice.", flags: MessageFlags.Ephemeral }).catch(() => {}); return; }
 
     setGuildVoice(guildId, picked);
 
@@ -483,22 +570,13 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
         );
         break;
       }
-      case "join": {
-        if (!memberVC) {
-          await editReply("❌ You must be in a voice channel for me to join you!");
-          return;
-        }
-        try {
-          await startReading(interaction.guild!, memberVC, textChannel, "Voice Check", [], "", [], 0, interaction.user.id);
-          await editReply(`Successfully joined **${memberVC.name}**!`);
-        } catch (err) {
-          await editReply(`❌ Voice error: ${(err as Error).message}`);
-        }
+      case "join":
+        await editReply(await handleJoin(interaction.guild, memberVC));
         break;
-      }
       case "find": {
-        const kw = cmd.options.getString("keyword", true);
-        await editReply(handleFind(interaction.guildId!, kw));
+        const kw    = cmd.options.getString("keyword", true);
+        const reply = handleFind(guildId, kw, true);
+        await cmd.editReply({ content: reply.content, components: reply.components }).catch(() => {});
         break;
       }
       case "stop":     await editReply(await handleStop(guildId)); break;
@@ -556,7 +634,7 @@ client.on(Events.MessageCreate, async (message: Message) => {
       return;
     }
 
-    if (command === "read") {
+    if (command === "read" || command === "join") {
       try { await message.reply("❌ Voice reading requires a server with voice channels. Use `/read` or `!read` in a server text channel, then you can control playback from here."); } catch { /* ignore */ }
       return;
     }
@@ -576,6 +654,7 @@ client.on(Events.MessageCreate, async (message: Message) => {
         case "resume":   reply = handleResume(guildId);     break;
         case "skip":     reply = handleSkip(guildId);       break;
         case "restart":  reply = handleRestart(guildId);    break;
+        case "find":     reply = handleFind(guildId, args.join(" "), false).content; break;
         case "chapter": {
           const num = parseInt(args[0] ?? "", 10);
           reply = isNaN(num) || num < 1 ? "❌ Usage: `!chapter <number>`" : handleChapter(guildId, num);
@@ -617,22 +696,13 @@ client.on(Events.MessageCreate, async (message: Message) => {
         );
         return;
       }
-case "find": {
-        const kw = args.join(" ");
-        reply = kw === "" ? "❌ Usage: `!find <keyword>`" : handleFind(message.guildId!, kw);
+      case "join": {
+        reply = await handleJoin(message.guild!, memberVC);
         break;
       }
-case "join": {
-        if (!memberVC) {
-          try { await message.reply("❌ You must be in a voice channel for me to join you!"); } catch {}
-          return;
-        }
-        try {
-          await startReading(message.guild!, memberVC, textChannel, "Voice Check", [], "", [], 0, message.author.id);
-          await message.reply(`Successfully joined **${memberVC.name}**!`);
-        } catch (err) {
-          try { await message.reply(`❌ Voice error: ${(err as Error).message}`); } catch {}
-        }
+      case "find": {
+        const r = handleFind(guildId, args.join(" "), true);
+        try { await message.reply({ content: r.content, components: r.components }); } catch (err) { console.error("[prefix find]", err); }
         return;
       }
       case "voice": {
@@ -674,14 +744,12 @@ case "join": {
   try { await message.reply(reply); } catch (err) { console.error("[prefix reply]", err); }
 });
 
-// ─── Start ────────────────────────────────────────────────────────────────────
-
 // ─── Tiny health server for Render / UptimeRobot ─────────────────────────────
 // Render requires a web service to bind a port. This keeps UptimeRobot happy
 // without needing a separate API server process.
-import { createServer } from "http";
-const PORT = process.env["PORT"] ? parseInt(process.env["PORT"]) : 3000;
-createServer((req, res) => {
+
+const PORT = process.env["PORT"] ? parseInt(process.env["PORT"], 10) : 3000;
+createServer((_req, res) => {
   res.writeHead(200, { "Content-Type": "text/plain" });
   res.end("OK");
 }).listen(PORT, () => console.log(`✅ Health server listening on port ${PORT}`));
