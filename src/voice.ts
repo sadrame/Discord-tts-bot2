@@ -71,8 +71,12 @@ export interface ReadSession {
   chapterBoundaries: number[];    // chunk indices where each chapter starts
   chapterTitles:     string[];
 
-  // Last /find results (for the prev/next match buttons)
+  // Last /find results (for the prev/next/go buttons)
   search: SearchState | null;
+
+  // Bookmark autosave bookkeeping
+  lastSavedIdx: number;
+  lastSavedAt:  number;
 
   progressTimer: ReturnType<typeof setInterval> | null;
 }
@@ -182,6 +186,27 @@ export function leaveStandby(guildId: string): boolean {
   return true;
 }
 
+// ─── Bookmarks ────────────────────────────────────────────────────────────────
+
+/** Save where the listener actually is (not where audio generation has got to).
+ *  Natural end of the chapter (chunkIndex === length) never saves a bookmark. */
+async function persistBookmark(session: ReadSession): Promise<void> {
+  if (!session.userId) return;
+  if (session.playingIdx <= 0 || session.chunkIndex >= session.allChunks.length) return;
+  await saveBookmark(
+    session.userId,
+    session.url,
+    session.playingIdx,
+    session.allChunks.length,
+    session.title,
+  ).catch((err) => console.error("[bookmark] save failed:", (err as Error).message));
+}
+
+/** Called on shutdown (Render sends SIGTERM on redeploys/restarts) so nobody loses their place. */
+export async function saveAllBookmarks(): Promise<void> {
+  await Promise.all([...sessions.values()].map((s) => persistBookmark(s)));
+}
+
 // ─── Session lifecycle ────────────────────────────────────────────────────────
 
 export function getSession(guildId: string): ReadSession | undefined {
@@ -199,17 +224,7 @@ export async function stopSession(guildId: string): Promise<void> {
     session.stopped = true;
     session.player.stop(true);
     userToGuild.delete(session.userId);
-    // Save where the listener actually is (not where audio generation has got to).
-    // Natural end of the chapter (chunkIndex === length) never saves a bookmark.
-    if (session.playingIdx > 0 && session.chunkIndex < session.allChunks.length) {
-      await saveBookmark(
-        guildId,
-        session.url,
-        session.playingIdx,
-        session.allChunks.length,
-        session.title,
-      ).catch(() => {});
-    }
+    await persistBookmark(session);
   }
   sessions.delete(guildId);
   destroyConnection(guildId);
@@ -289,6 +304,8 @@ export async function startReading(
     chapterBoundaries: dedupBounds,
     chapterTitles:    dedupTitles,
     search:           null,
+    lastSavedIdx:     startChunk,
+    lastSavedAt:      now,
     progressTimer:    null,
   };
 
@@ -308,6 +325,13 @@ export async function startReading(
     if (!s || s.stopped) return;
     s.lastProgressEdit = 0; // bypass rate-limit on timer tick
     updateProgress(s).catch(() => {});
+
+    // Autosave the listener's position every ~20s so a crash/restart/sleep loses almost nothing
+    if (s.playingIdx !== s.lastSavedIdx && Date.now() - s.lastSavedAt >= 20_000) {
+      s.lastSavedIdx = s.playingIdx;
+      s.lastSavedAt  = Date.now();
+      persistBookmark(s).catch(() => {});
+    }
   }, 5_000);
 
   let connection: VoiceConnection;
@@ -630,7 +654,7 @@ async function runPipeline(session: ReadSession): Promise<void> {
   await finalizeProgress(session, session.stopped);
 
   if (!session.stopped) {
-    await clearBookmark(session.guildId).catch(() => {});
+    if (session.userId) await clearBookmark(session.userId, session.url).catch(() => {});
     await stopSession(session.guildId);
   }
 }

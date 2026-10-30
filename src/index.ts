@@ -50,6 +50,7 @@ import {
   seekToParagraph,
   setSearchState,
   getSearchState,
+  saveAllBookmarks,
 } from "./voice.js";
 import { getBookmark } from "./bookmarks.js";
 import { VOICES } from "./voices.js";
@@ -61,6 +62,15 @@ const PREFIX = "!";
 // ─── Global crash guards ──────────────────────────────────────────────────────
 process.on("unhandledRejection", (reason) => console.error("[unhandledRejection]", reason));
 process.on("uncaughtException",  (err)    => console.error("[uncaughtException]", err));
+
+for (const sig of ["SIGTERM", "SIGINT"] as const) {
+  process.on(sig, () => {
+    console.log(`[${sig}] saving bookmarks before shutdown…`);
+    saveAllBookmarks()
+      .catch((err) => console.error("[shutdown] bookmark save failed:", err))
+      .finally(() => process.exit(0));
+  });
+}
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -270,13 +280,13 @@ async function handleRead(
   // ── Check for saved bookmark ─────────────────────────────────────────────
   let resumeFromChunk = 0;
   try {
-    const bookmark = await getBookmark(guildId);
-    if (bookmark && bookmark.url === url && bookmark.chunkIndex > 0) {
+    const bookmark = await getBookmark(requestedBy.id, url);
+    if (bookmark && bookmark.chunkIndex > 0) {
       resumeFromChunk = bookmark.chunkIndex;
       const pct = Math.round((bookmark.chunkIndex / bookmark.totalChunks) * 100);
       await safeSend(
         textChannel,
-        `📌 Resuming **${bookmark.title}** from where you left off (${pct}% done).`
+        `📌 Resuming **${bookmark.title}** from where you left off (${pct}% done). Use \`/restart\` to start from the beginning.`
       );
     }
   } catch { /* non-fatal */ }
@@ -353,14 +363,15 @@ interface FindReply {
   components: ActionRowBuilder<ButtonBuilder>[];
 }
 
-function buildFindRow(): ActionRowBuilder<ButtonBuilder> {
+function buildFindRow(total: number): ActionRowBuilder<ButtonBuilder> {
   return new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId("find_prev").setEmoji("⬅️").setLabel("Prev match").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("find_next").setEmoji("➡️").setLabel("Next match").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("find_prev").setEmoji("⬅️").setLabel("Prev").setStyle(ButtonStyle.Secondary).setDisabled(total <= 1),
+    new ButtonBuilder().setCustomId("find_go").setEmoji("▶️").setLabel("Go to this").setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId("find_next").setEmoji("➡️").setLabel("Next").setStyle(ButtonStyle.Secondary).setDisabled(total <= 1),
   );
 }
 
-function describeMatch(guildId: string, withButtons: boolean): FindReply {
+function describeMatch(guildId: string, withButtons: boolean, jumped = false): FindReply {
   const state      = getSearchState(guildId);
   const paragraphs = getParagraphs(guildId);
   if (!state || !paragraphs) return { content: "❌ That search has expired — run `/find` again.", components: [] };
@@ -372,9 +383,11 @@ function describeMatch(guildId: string, withButtons: boolean): FindReply {
     `*“${snippetFor(text, state.query)}”*`,
   ];
   if (state.fuzzy) lines.push("_No exact matches — showing similar spellings._");
+  if (jumped) lines.push("✅ Jumped here — playback continues from this paragraph.");
+  else if (withButtons) lines.push("Tap **Go to this** to jump there, or browse with ⬅️ ➡️.");
   return {
     content:    lines.join("\n"),
-    components: withButtons && state.matches.length > 1 ? [buildFindRow()] : [],
+    components: withButtons ? [buildFindRow(state.matches.length)] : [],
   };
 }
 
@@ -397,8 +410,14 @@ function handleFind(guildId: string, query: string, withButtons: boolean): FindR
   const current = getCurrentParagraphIndex(guildId) ?? 0;
   const pos     = pickStartPosition(result.matches, current);
   setSearchState(guildId, { query: q, matches: result.matches, pos, fuzzy: result.fuzzy });
-  seekToParagraph(guildId, result.matches[pos]!);
-  return describeMatch(guildId, withButtons);
+
+  // With buttons: show the match and wait for "Go to this".
+  // Without buttons (DMs): there's nothing to tap, so jump straight away.
+  if (!withButtons) {
+    seekToParagraph(guildId, result.matches[pos]!);
+    return describeMatch(guildId, false, true);
+  }
+  return describeMatch(guildId, true);
 }
 
 function stepFind(guildId: string, delta: number): FindReply | null {
@@ -406,8 +425,14 @@ function stepFind(guildId: string, delta: number): FindReply | null {
   if (!state || state.matches.length === 0) return null;
   const n = state.matches.length;
   state.pos = (state.pos + delta + n) % n;
-  seekToParagraph(guildId, state.matches[state.pos]!);
   return describeMatch(guildId, true);
+}
+
+function goFind(guildId: string): FindReply | null {
+  const state = getSearchState(guildId);
+  if (!state || state.matches.length === 0) return null;
+  if (!seekToParagraph(guildId, state.matches[state.pos]!)) return null;
+  return describeMatch(guildId, true, true);
 }
 
 function handleChapter(guildId: string, num: number): string {
@@ -488,8 +513,10 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
     const { customId } = btn;
 
     // /find prev / next match
-    if (customId === "find_prev" || customId === "find_next") {
-      const reply = stepFind(guildId, customId === "find_next" ? 1 : -1);
+    if (customId === "find_prev" || customId === "find_next" || customId === "find_go") {
+      const reply = customId === "find_go"
+        ? goFind(guildId)
+        : stepFind(guildId, customId === "find_next" ? 1 : -1);
       if (!reply) {
         await btn.reply({ content: "❌ That search has expired — run `/find` again.", flags: MessageFlags.Ephemeral }).catch(() => {});
         return;
