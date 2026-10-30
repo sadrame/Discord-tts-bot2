@@ -13,3 +13,5 @@ services:
         sync: false
       - key: DISCORD_LOG_CHANNEL_ID   # optional: channel that logs read requests
         sync: false
+      - key: VOICE_READY_TIMEOUT_MS   # how long to wait for Discord's voice handshake
+        value: "60000"
