@@ -23,7 +23,9 @@ import {
 } from "discord.js";
 import { textToMp3File, cleanupFile, splitIntoChunks, warmUpVoice } from "./tts.js";
 import type { VoiceOption } from "./voices.js";
-import { DEFAULT_VOICE } from "./voices.js";
+import { DEFAULT_VOICE, voiceDisplay } from "./voices.js";
+import { ElevenError, elevenEnabled } from "./eleven.js";
+import { kvGet, kvSet } from "./kv.js";
 import { saveBookmark, clearBookmark } from "./bookmarks.js";
 import type { ChapterSection } from "./scraper.js";
 
@@ -107,8 +109,21 @@ export function getGuildVoice(guildId: string): VoiceOption {
   return guildVoices.get(guildId) ?? DEFAULT_VOICE;
 }
 
-export function setGuildVoice(guildId: string, voice: VoiceOption): void {
+/** Load this server's saved voice (survives restarts when Upstash is configured). */
+export async function hydrateGuildVoice(guildId: string): Promise<void> {
+  if (guildVoices.has(guildId)) return;
+  try {
+    const raw = await kvGet(`wct:voice:${guildId}`);
+    if (!raw) return;
+    const v = JSON.parse(raw) as VoiceOption;
+    const valid = typeof v?.id === "string" && (v.service === "edge" || v.service === "elevenlabs");
+    if (valid && (v.service === "edge" || elevenEnabled())) guildVoices.set(guildId, v);
+  } catch { /* ignore — falls back to the default voice */ }
+}
+
+export function setGuildVoice(guildId: string, voice: VoiceOption, persist = true): void {
   guildVoices.set(guildId, voice);
+  if (persist) kvSet(`wct:voice:${guildId}`, JSON.stringify(voice), 60 * 60 * 24 * 365).catch(() => {});
   const session = sessions.get(guildId);
   if (session) {
     session.voiceVersion++;
@@ -447,7 +462,7 @@ function buildEmbed(session: ReadSession, voice: VoiceOption, loading = false): 
       .setColor(EMBED_COLOR_LOADING)
       .setTitle(`📖 ${session.title}`)
       .setDescription(`${"░".repeat(BAR_WIDTH)}\n⏳ Loading chapter...`)
-      .addFields({ name: "🎙️ Voice", value: `${flag} ${voice.label}`, inline: true });
+      .addFields({ name: "🎙️ Voice", value: `${flag} ${voiceDisplay(voice)}`, inline: true });
   }
 
   const elapsed  = getElapsedSeconds(session);
@@ -473,7 +488,7 @@ function buildEmbed(session: ReadSession, voice: VoiceOption, loading = false): 
     .setTitle(`📖 ${session.title}`)
     .setDescription(`${bar}\n${timeStr} · ${statusLine}`)
     .addFields(
-      { name: "🎙️ Voice",     value: `${flag} ${voice.label}`,                       inline: true },
+      { name: "🎙️ Voice",     value: `${flag} ${voiceDisplay(voice)}`,                       inline: true },
       { name: "📍 Paragraph", value: `${paraNo} / ${session.paragraphs.length}`,     inline: true },
     );
 
@@ -573,7 +588,7 @@ async function finalizeProgress(session: ReadSession, stopped = false): Promise<
       .setColor(EMBED_COLOR_STOPPED)
       .setTitle(`📖 ${session.title}`)
       .setDescription(`${bar}\n⏹️ Stopped at **${fmt(Math.min(elapsed, total))}** / ~${fmt(total)}`)
-      .addFields({ name: "🎙️ Voice", value: `${flag} ${voice.label}`, inline: true });
+      .addFields({ name: "🎙️ Voice", value: `${flag} ${voiceDisplay(voice)}`, inline: true });
     try { await session.progressMsg.edit({ embeds: [embed], components: [] }); } catch { /* ignore */ }
     return;
   }
@@ -582,7 +597,7 @@ async function finalizeProgress(session: ReadSession, stopped = false): Promise<
     .setColor(EMBED_COLOR_DONE)
     .setTitle(`📖 ${session.title}`)
     .setDescription(`${"▓".repeat(BAR_WIDTH)}\n✅ Finished! **${fmt(total)}**`)
-    .addFields({ name: "🎙️ Voice", value: `${flag} ${voice.label}`, inline: true });
+    .addFields({ name: "🎙️ Voice", value: `${flag} ${voiceDisplay(voice)}`, inline: true });
   try { await session.progressMsg.edit({ embeds: [embed], components: [] }); } catch { /* ignore */ }
 }
 
@@ -698,15 +713,18 @@ async function generateChunk(session: ReadSession): Promise<ChunkResult | null> 
         session.consecutiveSkips++;
         console.error(`[generateChunk] chunk ${chunkIdx} attempt ${localFails} (${voice.label}): ${(err as Error).message}`);
 
-        // After FALLBACK_THRESHOLD consecutive failures across chunks, switch to Jenny
-        if (session.consecutiveSkips >= FALLBACK_THRESHOLD && voice.id !== DEFAULT_VOICE.id) {
+        // Fatal ElevenLabs problems (quota used up, bad key, voice not allowed) won't fix themselves,
+        // so fall back at once. Otherwise fall back after FALLBACK_THRESHOLD consecutive failures.
+        const fatalEleven = err instanceof ElevenError && err.fatal;
+        if ((fatalEleven || session.consecutiveSkips >= FALLBACK_THRESHOLD) && voice.id !== DEFAULT_VOICE.id) {
           console.warn(`[generateChunk] switching from ${voice.label} to Jenny — retrying chunk ${chunkIdx}`);
-          setGuildVoice(session.guildId, DEFAULT_VOICE);
+          setGuildVoice(session.guildId, DEFAULT_VOICE, false);   // temporary: your saved voice choice stays
           session.consecutiveSkips = 0;
           localFails = 0; // give Jenny fresh attempts on this chunk
+          const reason = fatalEleven ? `: ${(err as Error).message}` : " right now";
           try {
             await (session.textChannel as any).send(
-              `⚠️ Voice **${voice.label}** isn't available right now — switching to **Jenny** to continue reading.`
+              `⚠️ Voice **${voice.label}** isn't available${reason} — switching to **Jenny** to continue reading.`
             );
           } catch { /* ignore */ }
         }

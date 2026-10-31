@@ -5,6 +5,7 @@ import { tmpdir } from "os";
 import { randomUUID } from "crypto";
 import type { VoiceOption } from "./voices.js";
 import { DEFAULT_VOICE } from "./voices.js";
+import { elevenSynthesize, ElevenError } from "./eleven.js";
 
 const TIMEOUT_MS = 30_000;
 
@@ -115,6 +116,27 @@ export async function textToMp3File(
 
   await acquireTts();
   try {
+    // ── ElevenLabs voices ────────────────────────────────────────────────────
+    if (voice.service === "elevenlabs") {
+      let elevenErr: Error = new Error("Unknown ElevenLabs error");
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          console.log(`[tts] elevenlabs voice=${voice.id} attempt=${attempt} len=${clean.length}`);
+          const audio    = await elevenSynthesize(clean, voice.id);
+          const filePath = join(tmpdir(), `wct-tts-${randomUUID()}.mp3`);
+          await writeFile(filePath, audio);
+          return filePath; // ✅
+        } catch (err) {
+          elevenErr = err as Error;
+          console.warn(`[tts] elevenlabs attempt ${attempt}/3 failed (${voice.id}): ${elevenErr.message}`);
+          if (err instanceof ElevenError && err.fatal) break;   // bad key / quota / not allowed — retrying won't help
+          if (attempt < 3) await sleep(2_000);
+        }
+      }
+      throw elevenErr;
+    }
+
+    // ── Bing / Edge voices ───────────────────────────────────────────────────
     let lastErr: Error = new Error("Unknown TTS error");
 
     for (let attempt = 1; attempt <= 3; attempt++) {

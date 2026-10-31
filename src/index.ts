@@ -17,7 +17,6 @@ import {
   ButtonBuilder,
   ButtonStyle,
   StringSelectMenuBuilder,
-  StringSelectMenuInteraction,
   ComponentType,
   ChannelType,
   VoiceBasedChannel,
@@ -42,7 +41,7 @@ import {
   getProgressSeconds,
   getChapterInfo,
   getGuildVoice,
-  setGuildVoice,
+  hydrateGuildVoice,
   joinStandby,
   leaveStandby,
   getParagraphs,
@@ -54,6 +53,7 @@ import {
 } from "./voice.js";
 import { getBookmark } from "./bookmarks.js";
 import { VOICES } from "./voices.js";
+import { showVoiceHome, showVoiceSearch, parseFilter, handleVoiceInteraction } from "./voicepicker.js";
 import { slashCommands } from "./commands.js";
 import { searchParagraphs, pickStartPosition, snippetFor } from "./search.js";
 
@@ -102,7 +102,8 @@ function helpText(): string {
     "`/restart` — restart the chapter from the beginning",
     "`/seek <seconds>` — jump to a timestamp (e.g. `/seek 120` = 2:00)",
     "`/progress` — show current progress info",
-    "`/voice` — pick a TTS voice from a dropdown",
+    "`/voice` — pick a voice: filter by Bing, ElevenLabs or Reader, test it, then apply",
+    "`/voicesearch <name or style>` — search voices (e.g. `sarah`, `british narrator`)",
     "`/invite` — get a link to add this bot to your server",
     "`/help` — show this message",
     "",
@@ -118,48 +119,6 @@ function helpText(): string {
 async function safeSend(channel: TextChannel | null | undefined, content: string): Promise<void> {
   if (!channel) return;
   try { await channel.send(content); } catch (err) { console.error("[safeSend]", err); }
-}
-
-// ─── Voice select menu builder ────────────────────────────────────────────────
-
-const ACCENT_FLAG: Record<string, string> = {
-  American:   "🇺🇸",
-  British:    "🇬🇧",
-  Australian: "🇦🇺",
-  Irish:      "🇮🇪",
-};
-
-function buildVoiceMenu(guildId: string): ActionRowBuilder<StringSelectMenuBuilder> {
-  const currentVoice = getGuildVoice(guildId);
-
-  const options = VOICES.map((v) => {
-    const flag   = ACCENT_FLAG[v.accent] ?? "🌐";
-    const gender = v.gender === "Female" ? "♀" : "♂";
-    return {
-      label:       v.label,
-      description: `${flag} ${v.accent} ${gender} · ${v.style}`,
-      value:       v.id,
-      default:     v.id === currentVoice.id,
-    };
-  });
-
-  const menu = new StringSelectMenuBuilder()
-    .setCustomId("voice_select")
-    .setPlaceholder("Choose a voice…")
-    .addOptions(options);
-
-  return new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu);
-}
-
-async function sendVoicePicker(
-  guildId: string,
-  sendFn: (payload: { content: string; components: ActionRowBuilder<StringSelectMenuBuilder>[] }) => Promise<Message | void>
-): Promise<void> {
-  const currentVoice = getGuildVoice(guildId);
-  await sendFn({
-    content:    `🎙️ Current voice: **${currentVoice.label}** — pick a new one below:`,
-    components: [buildVoiceMenu(guildId)],
-  });
 }
 
 // ─── VC picker ────────────────────────────────────────────────────────────────
@@ -255,6 +214,7 @@ async function handleRead(
   replyFn: (payload: { content: string; components?: ActionRowBuilder<StringSelectMenuBuilder>[] }) => Promise<Message | void>
 ): Promise<void> {
   if (!url.startsWith("http")) { await replyFn({ content: "❌ Please provide a valid URL." }); return; }
+  await hydrateGuildVoice(guildId);
 
   let voiceChannel: VoiceBasedChannel | null;
   if (explicitVC) {
@@ -507,6 +467,12 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
   if (!interaction.guild) return;
   const guildId = interaction.guild.id;
 
+  // ── Voice picker (buttons + select menus whose ids start with "vp_") ───────────
+  if ((interaction.isButton() || interaction.isStringSelectMenu()) && interaction.customId.startsWith("vp_")) {
+    await handleVoiceInteraction(interaction);
+    return;
+  }
+
   // ── Buttons ─────────────────────────────────────────────────────────────────
   if (interaction.isButton()) {
     const btn = interaction as ButtonInteraction;
@@ -554,24 +520,6 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
       await forceProgressUpdate(guildId).catch(() => {});
       return;
     }
-  }
-
-  // ── Voice select menu result ────────────────────────────────────────────────
-  if (interaction.isStringSelectMenu() && interaction.customId === "voice_select") {
-    const sel = interaction as StringSelectMenuInteraction;
-    const voiceId = sel.values[0]!;
-    const picked = VOICES.find((v) => v.id === voiceId);
-    if (!picked) { await sel.reply({ content: "❌ Unknown voice.", flags: MessageFlags.Ephemeral }).catch(() => {}); return; }
-
-    setGuildVoice(guildId, picked);
-
-    const flag   = ACCENT_FLAG[picked.accent] ?? "🌐";
-    const gender = picked.gender === "Female" ? "♀" : "♂";
-    await sel.update({
-      content:    `✅ Voice switched to **${picked.label}** ${flag} ${gender} · *${picked.style}*`,
-      components: [],
-    }).catch(() => {});
-    return;
   }
 
   // ── Slash commands ──────────────────────────────────────────────────────────
@@ -627,10 +575,14 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
       case "invite":   await editReply(`🔗 **Add me to your server:**\n${inviteUrl()}`); break;
 
       case "voice":
-        await sendVoicePicker(guildId,
-          (p) => cmd.editReply({ content: p.content, components: p.components }).catch(() => {})
-        );
+        await cmd.editReply(await showVoiceHome(guildId, interaction.user.id)).catch(() => {});
         break;
+      case "voicesearch": {
+        const query   = cmd.options.getString("query", true);
+        const service = parseFilter(cmd.options.getString("service"));
+        await cmd.editReply(await showVoiceSearch(guildId, interaction.user.id, query, service)).catch(() => {});
+        break;
+      }
 
       default: await editReply("❓ Unknown command."); break;
     }
@@ -733,12 +685,15 @@ client.on(Events.MessageCreate, async (message: Message) => {
         return;
       }
       case "voice": {
-        try {
-          await message.reply({
-            content:    `🎙️ Current voice: **${getGuildVoice(guildId).label}** — pick a new one below:`,
-            components: [buildVoiceMenu(guildId)],
-          });
-        } catch (err) { console.error("[prefix voice]", err); }
+        try { await message.reply(await showVoiceHome(guildId, message.author.id)); }
+        catch (err) { console.error("[prefix voice]", err); }
+        return;
+      }
+      case "voicesearch": {
+        const query = args.join(" ");
+        if (!query.trim()) { reply = "❌ Usage: `!voicesearch <name or style>` (e.g. `!voicesearch sarah`)"; break; }
+        try { await message.reply(await showVoiceSearch(guildId, message.author.id, query)); }
+        catch (err) { console.error("[prefix voicesearch]", err); }
         return;
       }
 
