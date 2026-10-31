@@ -10,10 +10,45 @@ export interface VoiceOption {
   previewUrl?: string;       // ElevenLabs hosted sample (free to play)
   ownerId?:    string;       // ElevenLabs Voice Library owner (voice must be added to the account)
   reader?:     boolean;      // enabled for the ElevenReader app
+  freeOk?:     boolean;      // ElevenLabs: usable on the free plan? (undefined = unknown)
+  tiers?:      string[];     // ElevenLabs: plans the voice is available on (when the API says)
+  category?:   string;       // ElevenLabs: premade / professional / famous / high_quality …
 }
 
 export function serviceName(v: VoiceOption): string {
   return v.service === "elevenlabs" ? "ElevenLabs" : "Bing (Edge)";
+}
+
+const TIER_ORDER = ["free", "starter", "creator", "pro", "scale", "business", "enterprise"];
+
+export function tierRank(tier: string): number {
+  return TIER_ORDER.indexOf(tier.toLowerCase());
+}
+
+function titleCase(s: string): string {
+  return s.charAt(0).toUpperCase() + s.slice(1).toLowerCase();
+}
+
+/** Lowest plan in a list of tiers (e.g. ["creator","enterprise"] → "creator"). */
+export function minTier(tiers: string[]): string | null {
+  let best: string | null = null;
+  let bestRank = Infinity;
+  for (const t of tiers) {
+    const r = tierRank(t);
+    if (r !== -1 && r < bestRank) { best = t.toLowerCase(); bestRank = r; }
+  }
+  return best ?? tiers[0]?.toLowerCase() ?? null;
+}
+
+/** Short plan requirement shown next to every voice. */
+export function planLabel(v: VoiceOption): string {
+  if (v.service === "edge") return "🆓 Free";
+  if (v.freeOk === true)    return "🆓 Free plan OK";
+  if (v.freeOk === false) {
+    const t = v.tiers && v.tiers.length > 0 ? minTier(v.tiers) : null;
+    return t && t !== "free" ? `💳 ${titleCase(t)}+ plan` : "💳 Paid plan";
+  }
+  return "✨ Plan varies";
 }
 
 /** Name plus engine, for embeds and messages. */

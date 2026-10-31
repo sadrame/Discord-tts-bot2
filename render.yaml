@@ -19,5 +19,7 @@ services:
         sync: false
       - key: ELEVENLABS_API_KEY        # optional: unlocks ElevenLabs + Reader voices (uses your ElevenLabs credits)
         sync: false
+      - key: SFX_ELEVENLABS            # "1" = generate scream/screech/etc sounds with ElevenLabs when no file is in /sounds
+        value: "0"
       - key: VOICE_READY_TIMEOUT_MS   # how long to wait for Discord's voice handshake
         value: "60000"

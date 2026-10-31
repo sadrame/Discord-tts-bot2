@@ -95,6 +95,8 @@ interface LibraryVoice {
   use_case?: string | null;
   description?: string | null;
   preview_url?: string | null;
+  free_users_allowed?: boolean;
+  category?: string;
 }
 
 interface AccountVoice {
@@ -104,6 +106,7 @@ interface AccountVoice {
   description?: string | null;
   preview_url?: string | null;
   labels?: Record<string, string> | null;
+  available_for_tiers?: string[] | null;
 }
 
 function fromLibrary(v: LibraryVoice, reader: boolean): VoiceOption {
@@ -113,17 +116,22 @@ function fromLibrary(v: LibraryVoice, reader: boolean): VoiceOption {
     accent: cap(v.accent), gender: cap(v.gender), style,
     ...(v.preview_url ? { previewUrl: v.preview_url } : {}),
     ...(v.public_owner_id ? { ownerId: v.public_owner_id } : {}),
+    ...(typeof v.free_users_allowed === "boolean" ? { freeOk: v.free_users_allowed } : {}),
+    ...(v.category ? { category: v.category } : {}),
     reader,
   };
 }
 
 function fromAccount(v: AccountVoice): VoiceOption {
-  const l = v.labels ?? {};
+  const l     = v.labels ?? {};
+  const tiers = (v.available_for_tiers ?? []).filter(Boolean);
   const style = [l["descriptive"], l["use_case"]].filter(Boolean).join(", ") || v.description?.slice(0, 80) || v.category || "Your voice";
   return {
     service: "elevenlabs", id: v.voice_id, label: (v.name ?? v.voice_id).slice(0, 100),
     accent: cap(l["accent"]), gender: cap(l["gender"]), style,
     ...(v.preview_url ? { previewUrl: v.preview_url } : {}),
+    ...(tiers.length > 0 ? { tiers, freeOk: tiers.some((t) => t.toLowerCase() === "free") } : {}),
+    ...(v.category ? { category: v.category } : {}),
   };
 }
 
@@ -172,11 +180,32 @@ export async function addLibraryVoice(voice: VoiceOption): Promise<{ id: string;
   }
 }
 
-export async function getUsage(): Promise<{ used: number; limit: number } | null> {
+export interface Usage { used: number; limit: number; tier: string }
+let usageCache: { at: number; usage: Usage } | null = null;
+
+/** Credits used/limit and your ElevenLabs plan (cached for a minute). */
+export async function getUsage(): Promise<Usage | null> {
+  if (usageCache && Date.now() - usageCache.at < 60_000) return usageCache.usage;
   try {
     const res  = await eleven("/v1/user/subscription", {}, 10_000);
-    const data = (await res.json()) as { character_count?: number; character_limit?: number };
+    const data = (await res.json()) as { character_count?: number; character_limit?: number; tier?: string };
     if (typeof data.character_count !== "number" || typeof data.character_limit !== "number") return null;
-    return { used: data.character_count, limit: data.character_limit };
+    const usage: Usage = { used: data.character_count, limit: data.character_limit, tier: (data.tier ?? "unknown").toLowerCase() };
+    usageCache = { at: Date.now(), usage };
+    return usage;
   } catch { return null; }
+}
+
+// ─── Sound effects (optional — used for the Bing-voice reactions) ─────────────
+
+/** Generate a short sound effect (≈25 credits per second). */
+export async function generateSoundEffect(prompt: string, seconds = 2): Promise<Buffer> {
+  const res = await eleven("/v1/sound-generation", {
+    method:  "POST",
+    headers: { "Content-Type": "application/json", Accept: "audio/mpeg" },
+    body:    JSON.stringify({ text: prompt, duration_seconds: seconds, prompt_influence: 0.5 }),
+  }, 60_000);
+  const buf = Buffer.from(await res.arrayBuffer());
+  if (buf.length === 0) throw new ElevenError("ElevenLabs returned an empty sound effect", res.status, false);
+  return buf;
 }

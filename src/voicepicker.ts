@@ -10,7 +10,7 @@ import {
   StringSelectMenuBuilder,
   StringSelectMenuInteraction,
 } from "discord.js";
-import { VOICES, serviceName } from "./voices.js";
+import { VOICES, serviceName, planLabel, tierRank } from "./voices.js";
 import type { VoiceOption } from "./voices.js";
 import {
   elevenEnabled,
@@ -94,7 +94,7 @@ function serviceTag(v: VoiceOption): string {
 
 function describe(v: VoiceOption): string {
   const flag = FLAG[v.accent] ?? "🌐";
-  const bits = [serviceTag(v), `${flag} ${v.accent} ${v.gender}`];
+  const bits = [serviceTag(v), planLabel(v), `${flag} ${v.accent} ${v.gender}`];
   if (v.style) bits.push(v.style);
   return bits.join(" · ").slice(0, 100);
 }
@@ -194,13 +194,16 @@ async function homeView(guildId: string, filter: VoiceFilter): Promise<ViewPaylo
   const lines = [`🎙️ Current voice: **${current.label}** (${serviceName(current)})`];
   if (filter === "eleven" && elevenEnabled()) {
     const usage = await getUsage();
-    if (usage) lines.push(`✨ ElevenLabs usage: **${usage.used.toLocaleString()} / ${usage.limit.toLocaleString()}** characters this period`);
+    if (usage) {
+      const plan = usage.tier.charAt(0).toUpperCase() + usage.tier.slice(1);
+      lines.push(`✨ Your ElevenLabs plan: **${plan}** · **${usage.used.toLocaleString()} / ${usage.limit.toLocaleString()}** credits used`);
+    }
   }
   lines.push(...notes);
   lines.push(voices.length > 0
     ? "Pick a voice to preview it — you can **Test** it before you **Apply** it."
     : "No voices to show here.");
-  lines.push("Search for more with `/voicesearch <name or style>`.");
+  lines.push("Each voice shows the plan it needs: 🆓 free · 💳 paid. Search with `/voicesearch <name or style>`.");
 
   const rows: Row[] = [filterRow(filter)];
   const select = selectRow(voices);
@@ -227,7 +230,7 @@ async function searchView(guildId: string, filter: VoiceFilter, query: string): 
   return { content: lines.join("\n"), embeds: [], components: rows };
 }
 
-function detailView(guildId: string, voice: VoiceOption): ViewPayload {
+async function detailView(guildId: string, voice: VoiceOption): Promise<ViewPayload> {
   const current   = getGuildVoice(guildId);
   const isCurrent = current.id === voice.id && current.service === voice.service;
   const flag      = FLAG[voice.accent] ?? "🌐";
@@ -239,12 +242,29 @@ function detailView(guildId: string, voice: VoiceOption): ViewPayload {
       { name: "Service", value: serviceName(voice),                        inline: true },
       { name: "Accent",  value: `${flag} ${voice.accent}`,                  inline: true },
       { name: "Gender",  value: voice.gender,                               inline: true },
+      { name: "Plan needed", value: planLabel(voice), inline: true },
       { name: "Style",   value: voice.style || "—" },
     )
     .setFooter({ text: isCurrent ? "This is your current voice." : "Tap Test to hear a sample, then Apply." });
 
   if (voice.service === "elevenlabs") {
     embed.addFields({ name: "Cost", value: "Reading with this voice uses your ElevenLabs credits. Test samples are free." });
+
+    // Warn when your plan is lower than what the voice needs
+    const usage = elevenEnabled() ? await getUsage() : null;
+    if (usage) {
+      const plan = usage.tier.charAt(0).toUpperCase() + usage.tier.slice(1);
+      const lowest = voice.tiers && voice.tiers.length > 0
+        ? Math.min(...voice.tiers.map((t) => (tierRank(t) === -1 ? 99 : tierRank(t))))
+        : null;
+      const needsPaidButFree = voice.freeOk === false && usage.tier === "free";
+      const belowRequired    = lowest !== null && lowest !== 99 && tierRank(usage.tier) !== -1 && tierRank(usage.tier) < lowest;
+      const tooLow           = needsPaidButFree || belowRequired;
+      embed.addFields({
+        name:  "Your plan",
+        value: tooLow ? `⚠️ You're on **${plan}** — this voice needs a higher plan, so it may not work.` : `You're on **${plan}**.`,
+      });
+    }
   }
 
   const key = voiceKey(voice);
@@ -316,7 +336,7 @@ export async function handleVoiceInteraction(i: ButtonInteraction | StringSelect
           return;
         }
         await i.deferUpdate();
-        await i.editReply(detailView(guildId, voice));
+        await i.editReply(await detailView(guildId, voice));
         return;
       }
 

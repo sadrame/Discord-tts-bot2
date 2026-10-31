@@ -6,6 +6,10 @@ import { randomUUID } from "crypto";
 import type { VoiceOption } from "./voices.js";
 import { DEFAULT_VOICE } from "./voices.js";
 import { elevenSynthesize, ElevenError } from "./eleven.js";
+import { splitWithSfx, softenShouting, getSfxFile, FALLBACK_SPEECH, SFX_ENABLED } from "./sfx.js";
+import type { Segment } from "./sfx.js";
+import { concatAudio, silenceFile } from "./media.js";
+import type { AudioPart } from "./media.js";
 
 const TIMEOUT_MS = 30_000;
 
@@ -97,6 +101,71 @@ async function synthesize(text: string, voiceId: string, filePath: string): Prom
   ]);
 }
 
+// ─── Bing / Edge synthesis (caller must hold the semaphore) ──────────────────
+
+async function edgeToFile(clean: string, voice: VoiceOption): Promise<string> {
+  let lastErr: Error = new Error("Unknown TTS error");
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const filePath = join(tmpdir(), `wct-tts-${randomUUID()}.mp3`);
+    try {
+      console.log(`[tts] voice=${voice.id} attempt=${attempt} len=${clean.length}`);
+      await synthesize(clean, voice.id, filePath);
+      return filePath; // ✅
+    } catch (err) {
+      lastErr = err as Error;
+      await unlink(filePath).catch(() => {});
+      // Invalidate the shared engine — stale or rate-limited connection.
+      // Next attempt creates a fresh WebSocket with the correct voice.
+      invalidateEngine();
+      console.warn(`[tts] attempt ${attempt}/3 failed (${voice.id}): ${lastErr.message}`);
+      if (attempt < 3) await sleep(2_000);
+    }
+  }
+  throw lastErr;
+}
+
+/** Speak the text parts, drop in sound clips for the reactions, and stitch it all into one mp3. */
+async function edgeWithSfx(segments: Segment[], plainText: string, voice: VoiceOption): Promise<string> {
+  const parts: AudioPart[] = [];
+  const temps: string[]    = [];
+  try {
+    for (const seg of segments) {
+      if (seg.type === "text") {
+        const t = sanitizeText(softenShouting(seg.text));
+        if (!/[\p{L}\p{N}]/u.test(t)) continue;
+        const f = await edgeToFile(t, voice);
+        temps.push(f); parts.push({ file: f });
+        continue;
+      }
+      const sound = await getSfxFile(seg.name);
+      if (sound) { parts.push({ file: sound, sfx: true }); continue; }
+
+      const spoken = FALLBACK_SPEECH[seg.name];            // no clip → say it instead of spelling letters
+      if (!spoken) continue;
+      const f = await edgeToFile(spoken, voice);
+      temps.push(f); parts.push({ file: f });
+    }
+
+    if (parts.length === 0) return await silenceFile();   // e.g. a lone *scratch* with no clip available
+
+    if (parts.length === 1 && !parts[0]!.sfx) {            // nothing to stitch
+      const only = parts[0]!.file;
+      temps.splice(temps.indexOf(only), 1);                // keep it — it's the result
+      return only;
+    }
+
+    try {
+      return await concatAudio(parts);
+    } catch (err) {
+      console.warn(`[tts] couldn't mix sound effects (${(err as Error).message}) — reading the text instead`);
+      return await edgeToFile(sanitizeText(softenShouting(plainText)), voice);
+    }
+  } finally {
+    await Promise.all(temps.map((f) => cleanupFile(f)));
+  }
+}
+
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 /**
@@ -136,27 +205,12 @@ export async function textToMp3File(
       throw elevenErr;
     }
 
-    // ── Bing / Edge voices ───────────────────────────────────────────────────
-    let lastErr: Error = new Error("Unknown TTS error");
-
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      const filePath = join(tmpdir(), `wct-tts-${randomUUID()}.mp3`);
-      try {
-        console.log(`[tts] voice=${voice.id} attempt=${attempt} len=${clean.length}`);
-        await synthesize(clean, voice.id, filePath);
-        return filePath; // ✅
-      } catch (err) {
-        lastErr = err as Error;
-        await unlink(filePath).catch(() => {});
-        // Invalidate the shared engine — stale or rate-limited connection.
-        // Next attempt creates a fresh WebSocket with the correct voice.
-        invalidateEngine();
-        console.warn(`[tts] attempt ${attempt}/3 failed (${voice.id}): ${lastErr.message}`);
-        if (attempt < 3) await sleep(2_000);
-      }
+    // ── Bing / Edge voices (with reactions: screams, screeches, scratches…) ──
+    const segments: Segment[] = SFX_ENABLED ? splitWithSfx(clean) : [{ type: "text", text: clean }];
+    if (segments.length === 1 && segments[0]!.type === "text") {
+      return await edgeToFile(sanitizeText(softenShouting(clean)), voice);
     }
-
-    throw lastErr;
+    return await edgeWithSfx(segments, clean, voice);
   } finally {
     releaseTts();
   }

@@ -22,6 +22,23 @@ export const slashCommands = [
     .setName("chapter")
     .setDescription("Jump to chapter/section N")
     .addIntegerOption((o) => o.setName("number").setDescription("Chapter number").setMinValue(1).setRequired(true)),
+  new SlashCommandBuilder()
+    .setName("speed")
+    .setDescription("Show or change reading speed (0.5× – 3×)")
+    .addNumberOption((o) => o.setName("value").setDescription("Speed multiplier, e.g. 1.25").setMinValue(0.5).setMaxValue(3))
+    .addNumberOption((o) => o.setName("step").setDescription("How much the Slower/Faster buttons change it (0.05 – 1)").setMinValue(0.05).setMaxValue(1)),
+  new SlashCommandBuilder()
+    .setName("rewind")
+    .setDescription("Go back (default: your skip step). Examples: 30, 1m, 1m30s")
+    .addStringOption((o) => o.setName("amount").setDescription("How far back, e.g. 30 or 1m30s")),
+  new SlashCommandBuilder()
+    .setName("forward")
+    .setDescription("Fast-forward (default: your skip step). Examples: 30, 1m, 1m30s")
+    .addStringOption((o) => o.setName("amount").setDescription("How far ahead, e.g. 30 or 1m30s")),
+  new SlashCommandBuilder()
+    .setName("skipstep")
+    .setDescription("Set how many seconds ⏪/⏩ and /rewind /forward move by default")
+    .addIntegerOption((o) => o.setName("seconds").setDescription("3 – 300").setMinValue(3).setMaxValue(300).setRequired(true)),
   new SlashCommandBuilder().setName("chapters").setDescription("List detected chapters in the current reading"),
   new SlashCommandBuilder().setName("restart").setDescription("Restart from the beginning"),
   new SlashCommandBuilder()

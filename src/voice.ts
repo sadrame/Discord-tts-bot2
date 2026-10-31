@@ -27,6 +27,7 @@ import { DEFAULT_VOICE, voiceDisplay } from "./voices.js";
 import { ElevenError, elevenEnabled } from "./eleven.js";
 import { kvGet, kvSet } from "./kv.js";
 import { saveBookmark, clearBookmark } from "./bookmarks.js";
+import { changeTempo } from "./media.js";
 import type { ChapterSection } from "./scraper.js";
 
 // How long to wait for Discord's voice handshake. Render's free tier can be slow,
@@ -55,6 +56,7 @@ export interface ReadSession {
   chunkIndex:       number;         // next chunk to GENERATE
   playingIdx:       number;         // chunk currently playing (what the user hears)
   seekEpoch:        number;         // bumped on every seek so stale audio is discarded
+  speed:            number;         // playback speed multiplier (0.5 – 3.0)
   paused:           boolean;
   stopped:          boolean;
   voiceVersion:     number;
@@ -109,16 +111,81 @@ export function getGuildVoice(guildId: string): VoiceOption {
   return guildVoices.get(guildId) ?? DEFAULT_VOICE;
 }
 
-/** Load this server's saved voice (survives restarts when Upstash is configured). */
+// ─── Per-server playback settings (speed, speed step, skip step) ──────────────
+
+export interface GuildPrefs {
+  speed:     number;   // 0.5 – 3.0
+  speedStep: number;   // how much the 🐢/🐇 buttons change speed
+  seekStep:  number;   // seconds moved by ⏪/⏩ and /rewind /forward when no amount is given
+}
+
+export const SPEED_MIN = 0.5;
+export const SPEED_MAX = 3.0;
+const DEFAULT_PREFS: GuildPrefs = { speed: 1, speedStep: 0.25, seekStep: 10 };
+const guildPrefs = new Map<string, GuildPrefs>();
+
+export function getPrefs(guildId: string): GuildPrefs {
+  return { ...(guildPrefs.get(guildId) ?? DEFAULT_PREFS) };
+}
+
+function clamp(n: number, lo: number, hi: number): number {
+  return Math.min(hi, Math.max(lo, n));
+}
+
+export function fmtSpeed(x: number): string {
+  return `${x.toFixed(2).replace(/0$/, "")}×`;
+}
+
+/** Change any of the settings; values are clamped to sensible ranges. Live sessions pick it up at once. */
+export function setPrefs(guildId: string, patch: Partial<GuildPrefs>): GuildPrefs {
+  const next = getPrefs(guildId);
+  if (patch.speed     !== undefined && Number.isFinite(patch.speed))     next.speed     = Math.round(clamp(patch.speed, SPEED_MIN, SPEED_MAX) * 20) / 20;
+  if (patch.speedStep !== undefined && Number.isFinite(patch.speedStep)) next.speedStep = Math.round(clamp(patch.speedStep, 0.05, 1) * 20) / 20;
+  if (patch.seekStep  !== undefined && Number.isFinite(patch.seekStep))  next.seekStep  = Math.round(clamp(patch.seekStep, 3, 300));
+  guildPrefs.set(guildId, next);
+  kvSet(`wct:prefs:${guildId}`, JSON.stringify(next), 60 * 60 * 24 * 365).catch(() => {});
+
+  const session = sessions.get(guildId);
+  if (session && session.speed !== next.speed) {
+    session.speed = next.speed;
+    rebaseClock(session, session.playingIdx);   // keep the progress bar continuous at the new speed
+  }
+  return next;
+}
+
+/** Nudge speed by a number of steps (+1 faster, −1 slower). */
+export function stepSpeed(guildId: string, direction: 1 | -1): GuildPrefs {
+  const p = getPrefs(guildId);
+  return setPrefs(guildId, { speed: p.speed + direction * p.speedStep });
+}
+
+const hydrated = new Set<string>();
+
+/** Load this server's saved voice and playback settings (survive restarts when Upstash is set up). */
 export async function hydrateGuildVoice(guildId: string): Promise<void> {
-  if (guildVoices.has(guildId)) return;
+  if (hydrated.has(guildId)) return;
+  hydrated.add(guildId);
   try {
-    const raw = await kvGet(`wct:voice:${guildId}`);
-    if (!raw) return;
-    const v = JSON.parse(raw) as VoiceOption;
-    const valid = typeof v?.id === "string" && (v.service === "edge" || v.service === "elevenlabs");
-    if (valid && (v.service === "edge" || elevenEnabled())) guildVoices.set(guildId, v);
-  } catch { /* ignore — falls back to the default voice */ }
+    if (!guildVoices.has(guildId)) {
+      const raw = await kvGet(`wct:voice:${guildId}`);
+      if (raw) {
+        const v = JSON.parse(raw) as VoiceOption;
+        const valid = typeof v?.id === "string" && (v.service === "edge" || v.service === "elevenlabs");
+        if (valid && (v.service === "edge" || elevenEnabled())) guildVoices.set(guildId, v);
+      }
+    }
+    if (!guildPrefs.has(guildId)) {
+      const raw = await kvGet(`wct:prefs:${guildId}`);
+      if (raw) {
+        const p = JSON.parse(raw) as Partial<GuildPrefs>;
+        guildPrefs.set(guildId, {
+          speed:     clamp(Number(p.speed)     || DEFAULT_PREFS.speed,     SPEED_MIN, SPEED_MAX),
+          speedStep: clamp(Number(p.speedStep) || DEFAULT_PREFS.speedStep, 0.05, 1),
+          seekStep:  clamp(Number(p.seekStep)  || DEFAULT_PREFS.seekStep,  3, 300),
+        });
+      }
+    }
+  } catch { /* ignore — falls back to defaults */ }
 }
 
 export function setGuildVoice(guildId: string, voice: VoiceOption, persist = true): void {
@@ -293,6 +360,7 @@ export async function startReading(
 
   const voice = getGuildVoice(guild.id);
   const now   = Date.now();
+  const speed = getPrefs(guild.id).speed;
 
   const session: ReadSession = {
     guildId:          guild.id,
@@ -305,6 +373,7 @@ export async function startReading(
     chunkIndex:       startChunk,
     playingIdx:       startChunk,
     seekEpoch:        0,
+    speed,
     paused:           false,
     stopped:          false,
     voiceVersion:     0,
@@ -313,7 +382,7 @@ export async function startReading(
     textChannel,
     progressMsg:      null,
     lastProgressEdit: 0,
-    readingStartedAt: now - currentChunkEstimatedSec(allChunks, startChunk) * 1000,
+    readingStartedAt: now - currentChunkEstimatedSec(allChunks, startChunk, speed) * 1000,
     pausedDuration:   0,
     pauseStartedAt:   null,
     chapterBoundaries: dedupBounds,
@@ -386,25 +455,33 @@ function getElapsedSeconds(session: ReadSession): number {
 
 const WORDS_PER_SEC = 2.5; // ~150 wpm TTS
 
-function chunkSeconds(chunk: string): number {
-  return Math.max(0.3, chunk.trim().split(/\s+/).length / WORDS_PER_SEC);
+function chunkSeconds(chunk: string, speed = 1): number {
+  return Math.max(0.3, chunk.trim().split(/\s+/).length / WORDS_PER_SEC) / speed;
 }
 
-function totalChapterSeconds(chunks: string[]): number {
-  return chunks.reduce((s, c) => s + chunkSeconds(c), 0);
+function totalChapterSeconds(chunks: string[], speed = 1): number {
+  return chunks.reduce((s, c) => s + chunkSeconds(c, speed), 0);
 }
 
-function chunkIndexAtSecond(chunks: string[], targetSec: number): number {
+function chunkIndexAtSecond(chunks: string[], targetSec: number, speed = 1): number {
   let elapsed = 0;
   for (let i = 0; i < chunks.length; i++) {
-    elapsed += chunkSeconds(chunks[i]!);
+    elapsed += chunkSeconds(chunks[i]!, speed);
     if (elapsed >= targetSec) return i;
   }
   return Math.max(0, chunks.length - 1);
 }
 
-function currentChunkEstimatedSec(chunks: string[], upTo: number): number {
-  return chunks.slice(0, upTo).reduce((s, c) => s + chunkSeconds(c), 0);
+function currentChunkEstimatedSec(chunks: string[], upTo: number, speed = 1): number {
+  return chunks.slice(0, upTo).reduce((s, c) => s + chunkSeconds(c, speed), 0);
+}
+
+/** Re-anchor the wall clock to a chunk so the progress bar follows seeks and speed changes. */
+function rebaseClock(session: ReadSession, chunk: number): void {
+  const now = Date.now();
+  session.readingStartedAt = now - currentChunkEstimatedSec(session.allChunks, chunk, session.speed) * 1000;
+  session.pausedDuration   = 0;
+  session.pauseStartedAt   = session.paused ? now : null;
 }
 
 function fmt(sec: number): string {
@@ -466,7 +543,7 @@ function buildEmbed(session: ReadSession, voice: VoiceOption, loading = false): 
   }
 
   const elapsed  = getElapsedSeconds(session);
-  const total    = totalChapterSeconds(session.allChunks);
+  const total    = totalChapterSeconds(session.allChunks, session.speed);
   const pct      = total > 0 ? Math.min(1, elapsed / total) : 0;
   const filled   = Math.round(pct * BAR_WIDTH);
   const bar      = "▓".repeat(filled) + "░".repeat(BAR_WIDTH - filled);
@@ -493,17 +570,20 @@ function buildEmbed(session: ReadSession, voice: VoiceOption, loading = false): 
     );
 
   if (chStr) embed.addFields({ name: "📑 Chapter", value: chStr, inline: true });
+  if (Math.abs(session.speed - 1) > 0.01) embed.addFields({ name: "⚡ Speed", value: fmtSpeed(session.speed), inline: true });
 
   return embed;
 }
 
-function buildControlRow(paused: boolean): ActionRowBuilder<ButtonBuilder> {
+function buildControlRow(session: ReadSession): ActionRowBuilder<ButtonBuilder> {
+  const paused = session.paused;
+  const step   = getPrefs(session.guildId).seekStep;
   return new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
       .setCustomId("ctrl_restart").setEmoji("⏮️").setLabel("Restart")
       .setStyle(ButtonStyle.Secondary),
     new ButtonBuilder()
-      .setCustomId("ctrl_back").setEmoji("⏪").setLabel("-10s")
+      .setCustomId("ctrl_back").setEmoji("⏪").setLabel(`-${step}s`)
       .setStyle(ButtonStyle.Secondary),
     new ButtonBuilder()
       .setCustomId("ctrl_pause")
@@ -511,11 +591,31 @@ function buildControlRow(paused: boolean): ActionRowBuilder<ButtonBuilder> {
       .setLabel(paused ? "Resume" : "Pause")
       .setStyle(paused ? ButtonStyle.Success : ButtonStyle.Primary),
     new ButtonBuilder()
-      .setCustomId("ctrl_forward").setEmoji("⏩").setLabel("+10s")
+      .setCustomId("ctrl_forward").setEmoji("⏩").setLabel(`+${step}s`)
       .setStyle(ButtonStyle.Secondary),
     new ButtonBuilder()
       .setCustomId("ctrl_stop").setEmoji("⏹️").setLabel("Stop")
       .setStyle(ButtonStyle.Danger),
+  );
+}
+
+function buildSpeedRow(session: ReadSession): ActionRowBuilder<ButtonBuilder> {
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId("ctrl_speed_down").setEmoji("🐢").setLabel("Slower")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(session.speed <= SPEED_MIN),
+    new ButtonBuilder()
+      .setCustomId("ctrl_speed_label").setLabel(fmtSpeed(session.speed))
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(true),
+    new ButtonBuilder()
+      .setCustomId("ctrl_speed_up").setEmoji("🐇").setLabel("Faster")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(session.speed >= SPEED_MAX),
+    new ButtonBuilder()
+      .setCustomId("ctrl_speed_custom").setEmoji("⚙️").setLabel("Custom…")
+      .setStyle(ButtonStyle.Secondary),
   );
 }
 
@@ -545,9 +645,10 @@ function buildProgressPayload(session: ReadSession, voice: VoiceOption, loading 
   // Buttons stay until finalizeProgress() replaces the embed at the end of the chapter
   if (loading) return { embeds: [embed], components: [] };
 
-  const components: ActionRowBuilder<ButtonBuilder>[] = [buildControlRow(session.paused)];
+  const components: ActionRowBuilder<ButtonBuilder>[] = [buildControlRow(session)];
   const chRow = buildChapterRow(session);
   if (chRow) components.push(chRow);
+  components.push(buildSpeedRow(session));
 
   return { embeds: [embed], components };
 }
@@ -578,7 +679,7 @@ async function finalizeProgress(session: ReadSession, stopped = false): Promise<
   const voice   = getGuildVoice(session.guildId);
   const flag    = FLAG[voice.accent] ?? "🌐";
   const elapsed = getElapsedSeconds(session);
-  const total   = totalChapterSeconds(session.allChunks);
+  const total   = totalChapterSeconds(session.allChunks, session.speed);
   const pct     = total > 0 ? Math.min(1, elapsed / total) : 0;
   const filled  = Math.round(pct * BAR_WIDTH);
 
@@ -646,13 +747,28 @@ async function runPipeline(session: ReadSession): Promise<void> {
     const nextPromise = generateChunk(session); // pre-generate while playing
 
     session.playingIdx = current.chunkIdx;
+
+    // Speed is applied just before playback, so a speed change takes effect on the next
+    // sentence and already-generated audio is reused (no extra ElevenLabs credits).
+    let playFile  = current.file;
+    let tempoFile: string | null = null;
+    if (Math.abs(session.speed - 1) > 0.01) {
+      try {
+        tempoFile = await changeTempo(current.file, session.speed);
+        playFile  = tempoFile;
+      } catch (err) {
+        console.warn(`[speed] couldn't change tempo (${(err as Error).message}) — playing at normal speed`);
+      }
+    }
+
     try {
-      const resource = createAudioResource(current.file, { inputType: StreamType.Arbitrary });
+      const resource = createAudioResource(playFile, { inputType: StreamType.Arbitrary });
       session.player.play(resource);
       await entersState(session.player, AudioPlayerStatus.Playing, 10_000);
       await waitForIdle(session);
     } catch { /* player stopped — ok */ } finally {
       await cleanupFile(current.file);
+      if (tempoFile) await cleanupFile(tempoFile);
     }
 
     await updateProgress(session);
@@ -766,7 +882,6 @@ export function resumeSession(guildId: string): boolean {
 function jumpToChunk(session: ReadSession, chunk: number): void {
   const total   = session.allChunks.length;
   const target  = Math.max(0, Math.min(chunk, total));
-  const now     = Date.now();
 
   session.chunkIndex       = target;
   session.playingIdx       = Math.min(target, Math.max(0, total - 1));
@@ -775,9 +890,7 @@ function jumpToChunk(session: ReadSession, chunk: number): void {
   session.consecutiveSkips = 0;
 
   // Rebase the clock so the bar and timestamps follow the new position
-  session.readingStartedAt = now - currentChunkEstimatedSec(session.allChunks, target) * 1000;
-  session.pausedDuration   = 0;
-  session.pauseStartedAt   = session.paused ? now : null;
+  rebaseClock(session, target);
 
   session.player.stop();
 }
@@ -803,13 +916,20 @@ export function seekSession(guildId: string, chunkIndex: number): boolean {
 export function seekSessionBySeconds(guildId: string, targetSec: number): boolean {
   const session = sessions.get(guildId);
   if (!session) return false;
-  return seekSession(guildId, chunkIndexAtSecond(session.allChunks, Math.max(0, targetSec)));
+  return seekSession(guildId, chunkIndexAtSecond(session.allChunks, Math.max(0, targetSec), session.speed));
 }
 
 export function seekRelativeSeconds(guildId: string, deltaSec: number): boolean {
   const session = sessions.get(guildId);
   if (!session) return false;
   return seekSessionBySeconds(guildId, getElapsedSeconds(session) + deltaSec);
+}
+
+/** Move playback by a number of seconds (negative = rewind). Returns the new position. */
+export function seekByDelta(guildId: string, deltaSec: number): { position: number; total: number } | null {
+  if (!seekRelativeSeconds(guildId, deltaSec)) return null;
+  const info = getProgressSeconds(guildId);
+  return info ? { position: info.currentSec, total: info.totalSec } : null;
 }
 
 export function restartSession(guildId: string): boolean {
@@ -879,7 +999,7 @@ export function getProgressSeconds(guildId: string): { currentSec: number; total
   if (!session) return null;
   return {
     currentSec: getElapsedSeconds(session),
-    totalSec:   totalChapterSeconds(session.allChunks),
+    totalSec:   totalChapterSeconds(session.allChunks, session.speed),
     title:      session.title,
   };
 }

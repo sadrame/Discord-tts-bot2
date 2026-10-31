@@ -17,6 +17,9 @@ import {
   ButtonBuilder,
   ButtonStyle,
   StringSelectMenuBuilder,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
   ComponentType,
   ChannelType,
   VoiceBasedChannel,
@@ -42,6 +45,13 @@ import {
   getChapterInfo,
   getGuildVoice,
   hydrateGuildVoice,
+  getPrefs,
+  setPrefs,
+  stepSpeed,
+  fmtSpeed,
+  seekByDelta,
+  SPEED_MIN,
+  SPEED_MAX,
   joinStandby,
   leaveStandby,
   getParagraphs,
@@ -51,6 +61,7 @@ import {
   getSearchState,
   saveAllBookmarks,
 } from "./voice.js";
+import type { GuildPrefs } from "./voice.js";
 import { getBookmark } from "./bookmarks.js";
 import { VOICES } from "./voices.js";
 import { showVoiceHome, showVoiceSearch, parseFilter, handleVoiceInteraction } from "./voicepicker.js";
@@ -97,6 +108,9 @@ function helpText(): string {
     "`/resume` — resume playback",
     "`/skip` — skip to the next paragraph",
     "`/find <text>` — search the chapter (typo-tolerant) and jump to it; use ⬅️ ➡️ to cycle matches",
+    "`/speed [value]` — show/set reading speed (0.5×–3×); use the 🐢 🐇 buttons or ⚙️ Custom… on the player for your own step sizes",
+    "`/rewind [amount]` · `/forward [amount]` — jump back/ahead, e.g. `30`, `1m`, `1m30s` (default: your skip step)",
+    "`/skipstep <seconds>` — change the default ⏪/⏩ step",
     "`/chapter <n>` — jump to chapter/section N",
     "`/chapters` — list all detected chapters in the current reading",
     "`/restart` — restart the chapter from the beginning",
@@ -107,7 +121,8 @@ function helpText(): string {
     "`/invite` — get a link to add this bot to your server",
     "`/help` — show this message",
     "",
-    "Progress embed buttons: ⏮️ Restart · ⏪ -10s · ⏸️ Pause · ⏩ +10s · ⏹️ Stop",
+    "Progress embed buttons: ⏮️ Restart · ⏪ back · ⏸️ Pause · ⏩ forward · ⏹️ Stop",
+    "Speed buttons: 🐢 Slower · 🐇 Faster · ⚙️ Custom… (speed, speed step, skip step)",
     "Chapter buttons: ⬅️ Prev Ch. · ➡️ Next Ch. (appear when chapters are detected)",
     "",
     "All commands also work with the `!` prefix.",
@@ -395,6 +410,92 @@ function goFind(guildId: string): FindReply | null {
   return describeMatch(guildId, true, true);
 }
 
+// ─── Speed, rewind and fast-forward ───────────────────────────────────────────
+
+/** "30" → 30, "1m" → 60, "1m30s" → 90, "1:30" → 90. */
+function parseDuration(input: string | null | undefined): number | null {
+  if (!input) return null;
+  const t = input.trim().toLowerCase();
+  if (/^\d+(\.\d+)?$/.test(t)) return Math.round(parseFloat(t));
+  const colon = t.match(/^(\d+):(\d{1,2})$/);
+  if (colon) return parseInt(colon[1]!, 10) * 60 + parseInt(colon[2]!, 10);
+  const m = t.match(/^(?:(\d+)\s*m(?:in(?:ute)?s?)?)?\s*(?:(\d+)\s*s(?:ec(?:ond)?s?)?)?$/);
+  if (m && (m[1] || m[2])) return parseInt(m[1] ?? "0", 10) * 60 + parseInt(m[2] ?? "0", 10);
+  return null;
+}
+
+function fmtDur(sec: number): string {
+  if (sec < 60) return `${sec}s`;
+  const m = Math.floor(sec / 60);
+  const r = sec % 60;
+  return r ? `${m}m ${r}s` : `${m}m`;
+}
+
+function handleMove(guildId: string, direction: 1 | -1, amount: string | null | undefined): string {
+  if (!getSession(guildId)) return "❌ Nothing is currently playing.";
+  let sec = getPrefs(guildId).seekStep;
+  if (amount && amount.trim()) {
+    const parsed = parseDuration(amount);
+    if (parsed === null || parsed < 1 || parsed > 3600) {
+      return "❌ Try a time like `30`, `1m` or `1m30s` (1 second to 60 minutes).";
+    }
+    sec = parsed;
+  }
+  const result = seekByDelta(guildId, direction * sec);
+  if (!result) return "❌ Nothing is currently playing.";
+  return `${direction < 0 ? "⏪ Rewound" : "⏩ Skipped ahead"} **${fmtDur(sec)}** — now at **${fmt(result.position)}** of ~${fmt(result.total)}`;
+}
+
+async function handleSpeed(guildId: string, value: number | null, step: number | null): Promise<string> {
+  await hydrateGuildVoice(guildId);
+  if (value === null && step === null) {
+    const p = getPrefs(guildId);
+    return (
+      `⚡ Speed: **${fmtSpeed(p.speed)}** (range ${fmtSpeed(SPEED_MIN)}–${fmtSpeed(SPEED_MAX)})\n` +
+      `Speed buttons change it by ${fmtSpeed(p.speedStep)} · skip step ${p.seekStep}s\n` +
+      "Set it with `/speed value:1.25`, or use 🐢 🐇 ⚙️ on the player."
+    );
+  }
+  const patch: Partial<GuildPrefs> = {};
+  if (value !== null) patch.speed = value;
+  if (step  !== null) patch.speedStep = step;
+  const p = setPrefs(guildId, patch);
+  await forceProgressUpdate(guildId).catch(() => {});
+  return `⚡ Speed set to **${fmtSpeed(p.speed)}** · button step ${fmtSpeed(p.speedStep)}.${getSession(guildId) ? " It applies from the next sentence." : ""}`;
+}
+
+async function handleSkipStep(guildId: string, seconds: number): Promise<string> {
+  await hydrateGuildVoice(guildId);
+  const p = setPrefs(guildId, { seekStep: seconds });
+  await forceProgressUpdate(guildId).catch(() => {});
+  return `⏩ Skip step set to **${p.seekStep}s** — used by the ⏪/⏩ buttons and by \`/rewind\` and \`/forward\` when you don't give an amount.`;
+}
+
+/** Text-prefix versions of the playback commands. Returns null if it isn't one of them. */
+async function handlePrefixPlayback(guildId: string, command: string, args: string[]): Promise<string | null> {
+  switch (command) {
+    case "speed": {
+      if (!args[0]) return handleSpeed(guildId, null, null);
+      const v  = parseFloat(args[0].replace(/x$/i, ""));
+      const st = args[1] ? parseFloat(args[1]) : null;
+      if (!Number.isFinite(v) || v < SPEED_MIN || v > SPEED_MAX) {
+        return `❌ Usage: \`!speed <${SPEED_MIN}–${SPEED_MAX}> [step]\` (e.g. \`!speed 1.25\`)`;
+      }
+      return handleSpeed(guildId, v, st !== null && Number.isFinite(st) ? st : null);
+    }
+    case "rewind": case "rw":
+      return handleMove(guildId, -1, args.join(""));
+    case "forward": case "ff": case "fastforward":
+      return handleMove(guildId, 1, args.join(""));
+    case "skipstep": {
+      const n = parseInt(args[0] ?? "", 10);
+      return Number.isFinite(n) && n >= 3 && n <= 300 ? handleSkipStep(guildId, n) : "❌ Usage: `!skipstep <3–300>` (seconds)";
+    }
+    default:
+      return null;
+  }
+}
+
 function handleChapter(guildId: string, num: number): string {
   const result = skipToChapter(guildId, num);
   if (!result.ok) return `❌ ${result.title || "No chapters detected in this content."}`;
@@ -467,6 +568,27 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
   if (!interaction.guild) return;
   const guildId = interaction.guild.id;
 
+  // ── Custom speed / step popup ───────────────────────────────────────────────
+  if (interaction.isModalSubmit() && interaction.customId === "ctrl_modal") {
+    const num = (id: string): number | undefined => {
+      const raw = interaction.fields.getTextInputValue(id).trim();
+      const n   = parseFloat(raw);
+      return raw === "" || !Number.isFinite(n) ? undefined : n;
+    };
+    const patch: Partial<GuildPrefs> = {};
+    const sp = num("m_speed"), st = num("m_speedstep"), sk = num("m_seekstep");
+    if (sp !== undefined) patch.speed     = sp;
+    if (st !== undefined) patch.speedStep = st;
+    if (sk !== undefined) patch.seekStep  = sk;
+    const p = setPrefs(guildId, patch);
+    await interaction.reply({
+      content: `✅ Speed **${fmtSpeed(p.speed)}** · speed step **${fmtSpeed(p.speedStep)}** · skip step **${p.seekStep}s**`,
+      flags:   MessageFlags.Ephemeral,
+    }).catch(() => {});
+    await forceProgressUpdate(guildId).catch(() => {});
+    return;
+  }
+
   // ── Voice picker (buttons + select menus whose ids start with "vp_") ───────────
   if ((interaction.isButton() || interaction.isStringSelectMenu()) && interaction.customId.startsWith("vp_")) {
     await handleVoiceInteraction(interaction);
@@ -492,13 +614,35 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
     }
 
     // Seek/restart/pause/stop/chapter control buttons on the progress bar
-    const CTRL_IDS = ["ctrl_restart","ctrl_back","ctrl_forward","ctrl_pause","ctrl_stop","ctrl_prev_chapter","ctrl_next_chapter"];
+    // ⚙️ Custom… opens a popup (must be answered with the popup, so no deferUpdate first)
+    if (customId === "ctrl_speed_custom") {
+      const p = getPrefs(guildId);
+      const field = (id: string, label: string, value: number) =>
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder().setCustomId(id).setLabel(label).setStyle(TextInputStyle.Short)
+            .setValue(String(value)).setRequired(false).setMaxLength(6)
+        );
+      const modal = new ModalBuilder()
+        .setCustomId("ctrl_modal")
+        .setTitle("Playback settings")
+        .addComponents(
+          field("m_speed",     "Speed (0.5 – 3.0)",              p.speed),
+          field("m_speedstep", "Speed button step (0.05 – 1)",   p.speedStep),
+          field("m_seekstep",  "Skip step in seconds (3 – 300)", p.seekStep),
+        );
+      await btn.showModal(modal).catch(() => {});
+      return;
+    }
+
+    const CTRL_IDS = ["ctrl_restart","ctrl_back","ctrl_forward","ctrl_pause","ctrl_stop","ctrl_prev_chapter","ctrl_next_chapter","ctrl_speed_down","ctrl_speed_up","ctrl_speed_label"];
     if (CTRL_IDS.includes(customId)) {
       await btn.deferUpdate().catch(() => {});
       switch (customId) {
         case "ctrl_restart":      restartSession(guildId); break;
-        case "ctrl_back":         seekRelativeSeconds(guildId, -10); break;
-        case "ctrl_forward":      seekRelativeSeconds(guildId, +10); break;
+        case "ctrl_back":         seekRelativeSeconds(guildId, -getPrefs(guildId).seekStep); break;
+        case "ctrl_forward":      seekRelativeSeconds(guildId, +getPrefs(guildId).seekStep); break;
+        case "ctrl_speed_down":   stepSpeed(guildId, -1); break;
+        case "ctrl_speed_up":     stepSpeed(guildId, +1); break;
         case "ctrl_pause": {
           const s = getSession(guildId);
           if (s?.paused) resumeSession(guildId); else pauseSession(guildId);
@@ -564,6 +708,12 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
         break;
       }
       case "chapters": await editReply(handleChapters(guildId)); break;
+      case "speed":
+        await editReply(await handleSpeed(guildId, cmd.options.getNumber("value"), cmd.options.getNumber("step")));
+        break;
+      case "rewind":   await editReply(handleMove(guildId, -1, cmd.options.getString("amount"))); break;
+      case "forward":  await editReply(handleMove(guildId, +1, cmd.options.getString("amount"))); break;
+      case "skipstep": await editReply(await handleSkipStep(guildId, cmd.options.getInteger("seconds", true))); break;
       case "restart":  await editReply(handleRestart(guildId));    break;
       case "seek": {
         const secs = cmd.options.getInteger("seconds", true);
@@ -640,6 +790,9 @@ client.on(Events.MessageCreate, async (message: Message) => {
           break;
         }
         case "chapters": reply = handleChapters(guildId); break;
+        case "speed": case "rewind": case "rw": case "forward": case "ff": case "fastforward": case "skipstep":
+          reply = (await handlePrefixPlayback(guildId, command, args)) ?? "";
+          break;
         case "seek": {
           const secs = parseInt(args[0] ?? "", 10);
           reply = isNaN(secs) || secs < 0 ? "❌ Usage: `!seek <seconds>`" : handleSeek(guildId, secs);
@@ -707,6 +860,9 @@ client.on(Events.MessageCreate, async (message: Message) => {
         break;
       }
       case "chapters": reply = handleChapters(guildId); break;
+      case "speed": case "rewind": case "rw": case "forward": case "ff": case "fastforward": case "skipstep":
+        reply = (await handlePrefixPlayback(guildId, command, args)) ?? "";
+        break;
       case "restart":  reply = handleRestart(guildId);    break;
       case "seek": {
         const secs = parseInt(args[0] ?? "", 10);
