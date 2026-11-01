@@ -3,7 +3,9 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=22.12.0" },
+  "engines": {
+    "node": ">=22.12.0"
+  },
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
@@ -24,5 +26,8 @@
     "@types/node": "^22.10.0",
     "tsx": "^4.19.0",
     "typescript": "^5.9.0"
+  },
+  "optionalDependencies": {
+    "@discordjs/opus": ">=0.9.0"
   }
 }

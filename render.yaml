@@ -21,5 +21,9 @@ services:
         sync: false
       - key: SFX_ELEVENLABS            # "1" = generate scream/screech/etc sounds with ElevenLabs when no file is in /sounds
         value: "0"
+      - key: TTS_CONCURRENCY           # speech requests running at once across ALL servers (ElevenLabs free plan: use 2)
+        value: "3"
+      - key: PREFETCH_SECONDS          # how much audio is generated ahead of playback
+        value: "20"
       - key: VOICE_READY_TIMEOUT_MS   # how long to wait for Discord's voice handshake
         value: "60000"
