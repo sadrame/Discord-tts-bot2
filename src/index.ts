@@ -62,6 +62,8 @@ import {
   saveAllBookmarks,
 } from "./voice.js";
 import type { GuildPrefs } from "./voice.js";
+import { MARKER_MODES } from "./markers.js";
+import type { MarkerMode } from "./markers.js";
 import { getBookmark } from "./bookmarks.js";
 import { VOICES } from "./voices.js";
 import { showVoiceHome, showVoiceSearch, parseFilter, handleVoiceInteraction } from "./voicepicker.js";
@@ -111,6 +113,7 @@ function helpText(): string {
     "`/speed [value]` — show/set reading speed (0.5×–3×); use the 🐢 🐇 buttons or ⚙️ Custom… on the player for your own step sizes",
     "`/rewind [amount]` · `/forward [amount]` — jump back/ahead, e.g. `30`, `1m`, `1m30s` (default: your skip step)",
     "`/skipstep <seconds>` — change the default ⏪/⏩ step",
+    "`/markers [style] [notes]` — how scene breaks (△▼△▼) and ※ dividers are announced: chime, voice, both or off; and whether to skip translator's notes",
     "`/chapter <n>` — jump to chapter/section N",
     "`/chapters` — list all detected chapters in the current reading",
     "`/restart` — restart the chapter from the beginning",
@@ -471,6 +474,28 @@ async function handleSkipStep(guildId: string, seconds: number): Promise<string>
   return `⏩ Skip step set to **${p.seekStep}s** — used by the ⏪/⏩ buttons and by \`/rewind\` and \`/forward\` when you don't give an amount.`;
 }
 
+async function handleMarkers(guildId: string, style: string | null, notes: string | null): Promise<string> {
+  await hydrateGuildVoice(guildId);
+  const patch: Partial<GuildPrefs> = {};
+  if (style && MARKER_MODES.includes(style as MarkerMode)) patch.markers = style as MarkerMode;
+  if (notes === "read" || notes === "skip") patch.notes = notes;
+
+  const changed = Object.keys(patch).length > 0;
+  const p = changed ? setPrefs(guildId, patch) : getPrefs(guildId);
+  const lines = [
+    `🔔 Dividers (△▼△▼, ※ ※ ※): **${p.markers}** · translator's notes: **${p.notes === "skip" ? "skipped" : "read"}**`,
+  ];
+  if (!changed) {
+    lines.push(
+      "Styles: `chime` = a short sound (a different one for scene breaks, notes and chapter end) · `voice` = says “Scene break”, “Translator's note”… · `both` · `off`",
+      "Change with `/markers style:chime notes:skip`.",
+    );
+  } else {
+    lines.push(patch.notes ? "Skipping notes applies the next time a chapter starts; the style applies right away." : "Applies right away.");
+  }
+  return lines.join("\n");
+}
+
 /** Text-prefix versions of the playback commands. Returns null if it isn't one of them. */
 async function handlePrefixPlayback(guildId: string, command: string, args: string[]): Promise<string | null> {
   switch (command) {
@@ -487,6 +512,11 @@ async function handlePrefixPlayback(guildId: string, command: string, args: stri
       return handleMove(guildId, -1, args.join(""));
     case "forward": case "ff": case "fastforward":
       return handleMove(guildId, 1, args.join(""));
+    case "markers": {
+      const style = args.find((a) => MARKER_MODES.includes(a.toLowerCase() as MarkerMode))?.toLowerCase() ?? null;
+      const notes = args.find((a) => a.toLowerCase() === "skip" || a.toLowerCase() === "read")?.toLowerCase() ?? null;
+      return handleMarkers(guildId, style, notes);
+    }
     case "skipstep": {
       const n = parseInt(args[0] ?? "", 10);
       return Number.isFinite(n) && n >= 3 && n <= 300 ? handleSkipStep(guildId, n) : "❌ Usage: `!skipstep <3–300>` (seconds)";
@@ -714,6 +744,9 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
       case "rewind":   await editReply(handleMove(guildId, -1, cmd.options.getString("amount"))); break;
       case "forward":  await editReply(handleMove(guildId, +1, cmd.options.getString("amount"))); break;
       case "skipstep": await editReply(await handleSkipStep(guildId, cmd.options.getInteger("seconds", true))); break;
+      case "markers":
+        await editReply(await handleMarkers(guildId, cmd.options.getString("style"), cmd.options.getString("notes")));
+        break;
       case "restart":  await editReply(handleRestart(guildId));    break;
       case "seek": {
         const secs = cmd.options.getInteger("seconds", true);
@@ -790,7 +823,7 @@ client.on(Events.MessageCreate, async (message: Message) => {
           break;
         }
         case "chapters": reply = handleChapters(guildId); break;
-        case "speed": case "rewind": case "rw": case "forward": case "ff": case "fastforward": case "skipstep":
+        case "speed": case "rewind": case "rw": case "forward": case "ff": case "fastforward": case "skipstep": case "markers":
           reply = (await handlePrefixPlayback(guildId, command, args)) ?? "";
           break;
         case "seek": {
@@ -860,7 +893,7 @@ client.on(Events.MessageCreate, async (message: Message) => {
         break;
       }
       case "chapters": reply = handleChapters(guildId); break;
-      case "speed": case "rewind": case "rw": case "forward": case "ff": case "fastforward": case "skipstep":
+      case "speed": case "rewind": case "rw": case "forward": case "ff": case "fastforward": case "skipstep": case "markers":
         reply = (await handlePrefixPlayback(guildId, command, args)) ?? "";
         break;
       case "restart":  reply = handleRestart(guildId);    break;

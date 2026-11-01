@@ -27,7 +27,9 @@ import { DEFAULT_VOICE, voiceDisplay } from "./voices.js";
 import { ElevenError, elevenEnabled } from "./eleven.js";
 import { kvGet, kvSet } from "./kv.js";
 import { saveBookmark, clearBookmark } from "./bookmarks.js";
-import { changeTempo } from "./media.js";
+import { changeTempo, toOpusOgg, opusEnabled } from "./media.js";
+import { planParagraphs, markerChunk, parseMarkerChunk, markerToFile, MARKER_MODES } from "./markers.js";
+import type { MarkerMode, NotesMode } from "./markers.js";
 import type { ChapterSection } from "./scraper.js";
 
 // How long to wait for Discord's voice handshake. Render's free tier can be slow,
@@ -55,6 +57,7 @@ export interface ReadSession {
   allChunks:        string[];
   chunkIndex:       number;         // next chunk to GENERATE
   playingIdx:       number;         // chunk currently playing (what the user hears)
+  lastFinished:     number;         // last chunk that played to the end (−1 before the first)
   seekEpoch:        number;         // bumped on every seek so stale audio is discarded
   speed:            number;         // playback speed multiplier (0.5 – 3.0)
   paused:           boolean;
@@ -86,10 +89,12 @@ export interface ReadSession {
 }
 
 interface ChunkResult {
-  file:         string;
+  file:         string;      // the synthesized audio (mp3)
   chunkIdx:     number;
   voiceVersion: number;
   epoch:        number;
+  playFile?:    string;      // the same audio pre-encoded as Ogg/Opus, ready to play with almost no CPU
+  playSpeed?:   number;      // speed it was encoded at
 }
 
 const sessions    = new Map<string, ReadSession>();
@@ -117,11 +122,13 @@ export interface GuildPrefs {
   speed:     number;   // 0.5 – 3.0
   speedStep: number;   // how much the 🐢/🐇 buttons change speed
   seekStep:  number;   // seconds moved by ⏪/⏩ and /rewind /forward when no amount is given
+  markers:   MarkerMode;  // how ※ / △▼ dividers are announced: chime, voice, both or off
+  notes:     NotesMode;   // "skip" leaves out translator's notes (applies when a chapter starts)
 }
 
 export const SPEED_MIN = 0.5;
 export const SPEED_MAX = 3.0;
-const DEFAULT_PREFS: GuildPrefs = { speed: 1, speedStep: 0.25, seekStep: 10 };
+const DEFAULT_PREFS: GuildPrefs = { speed: 1, speedStep: 0.25, seekStep: 10, markers: "chime", notes: "read" };
 const guildPrefs = new Map<string, GuildPrefs>();
 
 export function getPrefs(guildId: string): GuildPrefs {
@@ -142,6 +149,8 @@ export function setPrefs(guildId: string, patch: Partial<GuildPrefs>): GuildPref
   if (patch.speed     !== undefined && Number.isFinite(patch.speed))     next.speed     = Math.round(clamp(patch.speed, SPEED_MIN, SPEED_MAX) * 20) / 20;
   if (patch.speedStep !== undefined && Number.isFinite(patch.speedStep)) next.speedStep = Math.round(clamp(patch.speedStep, 0.05, 1) * 20) / 20;
   if (patch.seekStep  !== undefined && Number.isFinite(patch.seekStep))  next.seekStep  = Math.round(clamp(patch.seekStep, 3, 300));
+  if (patch.markers   !== undefined && MARKER_MODES.includes(patch.markers)) next.markers = patch.markers;
+  if (patch.notes === "read" || patch.notes === "skip") next.notes = patch.notes;
   guildPrefs.set(guildId, next);
   kvSet(`wct:prefs:${guildId}`, JSON.stringify(next), 60 * 60 * 24 * 365).catch(() => {});
 
@@ -182,6 +191,8 @@ export async function hydrateGuildVoice(guildId: string): Promise<void> {
           speed:     clamp(Number(p.speed)     || DEFAULT_PREFS.speed,     SPEED_MIN, SPEED_MAX),
           speedStep: clamp(Number(p.speedStep) || DEFAULT_PREFS.speedStep, 0.05, 1),
           seekStep:  clamp(Number(p.seekStep)  || DEFAULT_PREFS.seekStep,  3, 300),
+          markers:   MARKER_MODES.includes(p.markers as MarkerMode) ? (p.markers as MarkerMode) : DEFAULT_PREFS.markers,
+          notes:     p.notes === "skip" ? "skip" : "read",
         });
       }
     }
@@ -195,6 +206,11 @@ export function setGuildVoice(guildId: string, voice: VoiceOption, persist = tru
   if (session) {
     session.voiceVersion++;
     session.consecutiveSkips = 0;
+    // Everything already generated is in the old voice: drop it and carry on from where the listener is —
+    // the paragraph being heard restarts in the new voice, otherwise the next unplayed one starts.
+    const idle = session.player.state.status === AudioPlayerStatus.Idle;
+    session.chunkIndex = Math.max(0, idle ? session.lastFinished + 1 : session.playingIdx);
+    session.seekEpoch++;
     session.player.stop();
   }
   warmUpVoice(voice);
@@ -329,9 +345,14 @@ export async function startReading(
   // Build chunks and map paragraph → first chunk index (for chapter boundaries)
   const allChunks: string[] = [];
   const paragraphStarts: number[] = [];
-  for (const para of paragraphs) {
+  const plans = planParagraphs(paragraphs);          // finds ※ rows, △▼ scene breaks, translator's notes
+  const skipNotes = getPrefs(guild.id).notes === "skip";
+  for (let pi = 0; pi < paragraphs.length; pi++) {
     paragraphStarts.push(allChunks.length);
-    allChunks.push(...splitIntoChunks(para));
+    const plan = plans[pi]!;
+    if (skipNotes && plan.inNote && plan.kind !== "chapter-end") continue;      // note left out (still keeps its place in the list)
+    if (plan.kind) { allChunks.push(markerChunk(plan.kind)); continue; }        // announced instead of read
+    allChunks.push(...splitIntoChunks(paragraphs[pi]!));
   }
   const startChunk = Math.max(0, Math.min(resumeFromChunk, Math.max(0, allChunks.length - 1)));
 
@@ -372,6 +393,7 @@ export async function startReading(
     allChunks,
     chunkIndex:       startChunk,
     playingIdx:       startChunk,
+    lastFinished:     startChunk - 1,
     seekEpoch:        0,
     speed,
     paused:           false,
@@ -456,6 +478,7 @@ function getElapsedSeconds(session: ReadSession): number {
 const WORDS_PER_SEC = 2.5; // ~150 wpm TTS
 
 function chunkSeconds(chunk: string, speed = 1): number {
+  if (parseMarkerChunk(chunk)) return 1.2 / speed;
   return Math.max(0.3, chunk.trim().split(/\s+/).length / WORDS_PER_SEC) / speed;
 }
 
@@ -714,66 +737,108 @@ async function waitForIdle(session: ReadSession): Promise<void> {
   }
 }
 
-/** Throw away a pre-generated chunk, rewinding the generator unless a seek already moved it. */
-async function discardChunk(session: ReadSession, chunk: ChunkResult): Promise<void> {
-  if (chunk.epoch === session.seekEpoch) session.chunkIndex = chunk.chunkIdx;
+async function discardResult(chunk: ChunkResult): Promise<void> {
   await cleanupFile(chunk.file);
+  if (chunk.playFile) await cleanupFile(chunk.playFile);
 }
 
-/** Make sure a pre-generated chunk is still valid (no seek / voice change since it was made). */
-async function validateChunk(session: ReadSession, chunk: ChunkResult | null): Promise<ChunkResult | null> {
-  if (!chunk) return null;
-  if (chunk.epoch !== session.seekEpoch || chunk.voiceVersion !== session.voiceVersion) {
-    await discardChunk(session, chunk);
-    return generateChunk(session);
+/** Encode a clip to Ogg/Opus ahead of time. null = couldn't (play it the slower way instead). */
+async function prepareOpus(file: string, speed: number): Promise<string | null> {
+  if (!opusEnabled()) return null;
+  try {
+    return await toOpusOgg(file, speed);
+  } catch (err) {
+    console.warn(`[opus] pre-encode failed (${(err as Error).message}) — falling back to live transcoding`);
+    return null;
   }
-  return chunk;
 }
+
+// How much audio to keep generated ahead of what's playing. Paragraphs are often a single short line, so
+// looking ahead by ONE of them (the old behaviour) left only a couple of seconds to absorb any delay —
+// with several servers reading at once that showed up as long pauses.
+const PREFETCH_SECONDS    = Math.max(2, Number(process.env["PREFETCH_SECONDS"]) || 20);
+const PREFETCH_MAX_CHUNKS = 8;
 
 async function runPipeline(session: ReadSession): Promise<void> {
-  let next = await generateChunk(session);
-  await updateProgress(session); // flip from "loading" to live progress
+  const queue: ChunkResult[] = [];      // generated + encoded, waiting to play (in order)
+  let producing = false;
 
-  while (next !== null && !session.stopped) {
-    if (session.paused) {
-      await discardChunk(session, next);
-      while (session.paused && !session.stopped) await sleep(200);
-      if (session.stopped) break;
-      next = await generateChunk(session);
-      continue;
-    }
+  const bufferedSeconds = (): number =>
+    queue.reduce((sum, c) => sum + chunkSeconds(session.allChunks[c.chunkIdx] ?? "", session.speed), 0);
 
-    const current     = next;
-    const nextPromise = generateChunk(session); // pre-generate while playing
-
-    session.playingIdx = current.chunkIdx;
-
-    // Speed is applied just before playback, so a speed change takes effect on the next
-    // sentence and already-generated audio is reused (no extra ElevenLabs credits).
-    let playFile  = current.file;
-    let tempoFile: string | null = null;
-    if (Math.abs(session.speed - 1) > 0.01) {
-      try {
-        tempoFile = await changeTempo(current.file, session.speed);
-        playFile  = tempoFile;
-      } catch (err) {
-        console.warn(`[speed] couldn't change tempo (${(err as Error).message}) — playing at normal speed`);
-      }
-    }
-
+  /** Keeps the queue topped up in the background while a clip plays. */
+  const produce = async (): Promise<void> => {
+    if (producing) return;
+    producing = true;
     try {
-      const resource = createAudioResource(playFile, { inputType: StreamType.Arbitrary });
-      session.player.play(resource);
-      await entersState(session.player, AudioPlayerStatus.Playing, 10_000);
-      await waitForIdle(session);
-    } catch { /* player stopped — ok */ } finally {
-      await cleanupFile(current.file);
-      if (tempoFile) await cleanupFile(tempoFile);
+      while (!session.stopped && !session.paused && queue.length < PREFETCH_MAX_CHUNKS && bufferedSeconds() < PREFETCH_SECONDS) {
+        const chunk = await generateChunk(session);
+        if (!chunk) break;
+        if (session.stopped || chunk.epoch !== session.seekEpoch) { await discardResult(chunk); continue; }
+        queue.push(chunk);
+      }
+    } catch (err) {
+      console.error("[pipeline] generator error:", err);
+    } finally {
+      producing = false;
     }
+  };
 
-    await updateProgress(session);
+  /** A seek or voice change makes everything queued stale. */
+  const dropStale = async (): Promise<void> => {
+    const stale = queue.filter((c) => c.epoch !== session.seekEpoch);
+    if (stale.length === 0) return;
+    for (const c of stale) queue.splice(queue.indexOf(c), 1);
+    await Promise.all(stale.map(discardResult));
+  };
 
-    next = await validateChunk(session, await nextPromise);
+  try {
+    void produce();
+
+    while (!session.stopped) {
+      await dropStale();
+      if (session.paused) { await sleep(200); continue; }
+
+      // Check for the end BEFORE (re)starting the generator, or it would always look busy
+      if (queue.length === 0 && !producing && session.chunkIndex >= session.allChunks.length) break;   // nothing left to read
+
+      void produce();
+      const current = queue.shift();
+      if (!current) { await sleep(50); continue; }                                 // still generating
+
+      session.playingIdx = current.chunkIdx;
+
+      // Normally the clip was already encoded for playback. If the speed changed since, redo just this one.
+      const cleanup: string[] = [current.file];
+      let playFile: string | null = current.playFile ?? null;
+      let inputType = StreamType.OggOpus;
+      if (playFile) cleanup.push(playFile);
+      if (playFile && current.playSpeed !== session.speed) {
+        const redone = await prepareOpus(current.file, session.speed);
+        if (redone) { playFile = redone; cleanup.push(redone); } else playFile = null;
+      }
+      if (!playFile) {                                   // fallback: let the player transcode the mp3 live
+        playFile  = current.file;
+        inputType = StreamType.Arbitrary;
+        if (Math.abs(session.speed - 1) > 0.01) {
+          try { const t = await changeTempo(current.file, session.speed); cleanup.push(t); playFile = t; }
+          catch (err) { console.warn(`[speed] couldn't change tempo (${(err as Error).message}) — playing at normal speed`); }
+        }
+      }
+
+      try {
+        session.player.play(createAudioResource(playFile, { inputType }));
+        await entersState(session.player, AudioPlayerStatus.Playing, 10_000);
+        await waitForIdle(session);
+        if (current.epoch === session.seekEpoch) session.lastFinished = current.chunkIdx;
+      } catch { /* player stopped — ok */ } finally {
+        await Promise.all(cleanup.map((f) => cleanupFile(f)));
+      }
+
+      await updateProgress(session);
+    }
+  } finally {
+    await Promise.all(queue.splice(0).map(discardResult));
   }
 
   // Stop timer before finalizing
@@ -812,18 +877,26 @@ async function generateChunk(session: ReadSession): Promise<ChunkResult | null> 
       const voice           = getGuildVoice(session.guildId);
 
       try {
-        const file = await textToMp3File(text, voice);
+        const marker = parseMarkerChunk(text);
+        const file   = marker
+          ? await markerToFile(marker, getPrefs(session.guildId).markers, voice)
+          : await textToMp3File(text, voice);
 
-        // A seek happened while this chunk was being generated → it's stale, start over
+        // Encode for playback now, while the previous clip is still playing
+        const speed    = session.speed;
+        const playFile = await prepareOpus(file, speed);
+
+        // A seek (or voice change) happened while this chunk was being generated → it's stale, start over
         if (session.stopped || session.seekEpoch !== epoch) {
           await cleanupFile(file);
+          if (playFile) await cleanupFile(playFile);
           if (session.stopped) return null;
           continue outer;
         }
 
         session.chunkIndex++;          // advance only on success
         session.consecutiveSkips = 0;
-        return { file, chunkIdx, voiceVersion: capturedVersion, epoch };
+        return { file, chunkIdx, voiceVersion: capturedVersion, epoch, ...(playFile ? { playFile, playSpeed: speed } : {}) };
       } catch (err) {
         localFails++;
         session.consecutiveSkips++;
@@ -834,7 +907,7 @@ async function generateChunk(session: ReadSession): Promise<ChunkResult | null> 
         const fatalEleven = err instanceof ElevenError && err.fatal;
         if ((fatalEleven || session.consecutiveSkips >= FALLBACK_THRESHOLD) && voice.id !== DEFAULT_VOICE.id) {
           console.warn(`[generateChunk] switching from ${voice.label} to Jenny — retrying chunk ${chunkIdx}`);
-          setGuildVoice(session.guildId, DEFAULT_VOICE, false);   // temporary: your saved voice choice stays
+          guildVoices.set(session.guildId, DEFAULT_VOICE);        // temporary: your saved voice choice stays, and queued audio is kept
           session.consecutiveSkips = 0;
           localFails = 0; // give Jenny fresh attempts on this chunk
           const reason = fatalEleven ? `: ${(err as Error).message}` : " right now";
@@ -884,6 +957,7 @@ function jumpToChunk(session: ReadSession, chunk: number): void {
   const target  = Math.max(0, Math.min(chunk, total));
 
   session.chunkIndex       = target;
+  session.lastFinished     = target - 1;
   session.playingIdx       = Math.min(target, Math.max(0, total - 1));
   session.seekEpoch++;
   session.voiceVersion++;

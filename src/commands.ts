@@ -39,6 +39,23 @@ export const slashCommands = [
     .setName("skipstep")
     .setDescription("Set how many seconds ⏪/⏩ and /rewind /forward move by default")
     .addIntegerOption((o) => o.setName("seconds").setDescription("3 – 300").setMinValue(3).setMaxValue(300).setRequired(true)),
+  new SlashCommandBuilder()
+    .setName("markers")
+    .setDescription("How scene breaks (△▼△▼) and ※ ※ ※ dividers are announced, and whether to skip translator's notes")
+    .addStringOption((o) =>
+      o.setName("style").setDescription("How dividers are announced")
+        .addChoices(
+          { name: "Chime (a short sound)",     value: "chime" },
+          { name: "Voice (say it out loud)",   value: "voice" },
+          { name: "Both",                      value: "both" },
+          { name: "Off (silent)",              value: "off" },
+        ))
+    .addStringOption((o) =>
+      o.setName("notes").setDescription("Translator's notes between ※ rows")
+        .addChoices(
+          { name: "Read them",  value: "read" },
+          { name: "Skip them",  value: "skip" },
+        )),
   new SlashCommandBuilder().setName("chapters").setDescription("List detected chapters in the current reading"),
   new SlashCommandBuilder().setName("restart").setDescription("Restart from the beginning"),
   new SlashCommandBuilder()

@@ -24,81 +24,93 @@ function sanitizeText(text: string): string {
     .trim();
 }
 
-// ─── Single shared WebSocket engine ──────────────────────────────────────────
-// ONE MsEdgeTTS instance for ALL voices.
-// When the voice changes, setMetadata() triggers ONE reconnect.
-// When the voice stays the same, the open connection is reused (zero overhead).
-// This avoids the rapid reconnect rate-limiting that broke non-Jenny voices.
-let sharedEngine: MsEdgeTTS | null = null;
-let engineVoiceId: string | null = null; // tracks what voice the engine is set to
+// ─── Engine pool + shared concurrency limit ──────────────────────────────────
+// Several servers read at the same time, so synthesis must not funnel through ONE connection
+// or ONE lock (that made servers wait on each other and reconnect on every voice change).
+//
+//  • Up to TTS_CONCURRENCY syntheses run in parallel (default 3), each on its own connection.
+//  • Idle connections are kept; a request prefers one already set to its voice (no reconnect).
+//  • When a request fails, only THAT connection is thrown away — other servers are unaffected.
 
-async function getEngine(voiceId: string): Promise<MsEdgeTTS> {
-  if (sharedEngine && engineVoiceId === voiceId) {
-    // Same voice — reuse the open connection
-    return sharedEngine;
-  }
+const MAX_CONCURRENT = Math.max(1, Math.min(8, Number(process.env["TTS_CONCURRENCY"]) || 3));
+const EDGE_FORMAT    = OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3;
 
-  if (!sharedEngine) {
-    sharedEngine = new MsEdgeTTS();
-    console.log("[tts] Creating new MsEdgeTTS instance");
-  }
+interface PooledEngine { engine: MsEdgeTTS; voiceId: string | null }
+const idleEngines: PooledEngine[] = [];
 
-  // Voice changed (or first init) — setMetadata reconnects once
-  await sharedEngine.setMetadata(voiceId, OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3);
-  engineVoiceId = voiceId;
-  console.log(`[tts] WebSocket set to voice: ${voiceId}`);
-  return sharedEngine;
+function closeEngine(p: PooledEngine): void {
+  try { (p.engine as unknown as { close?: () => void }).close?.(); } catch { /* already closed */ }
 }
 
-function invalidateEngine(): void {
-  sharedEngine = null;
-  engineVoiceId = null;
-  console.log("[tts] WebSocket invalidated — will reconnect on next request");
+async function checkoutEngine(voiceId: string): Promise<PooledEngine> {
+  let i = idleEngines.findIndex((e) => e.voiceId === voiceId);   // same voice → reuse as-is
+  if (i === -1 && idleEngines.length > 0) i = 0;                 // otherwise re-point an idle one
+  const pooled: PooledEngine = i !== -1 ? idleEngines.splice(i, 1)[0]! : { engine: new MsEdgeTTS(), voiceId: null };
+
+  if (pooled.voiceId !== voiceId) {
+    try {
+      await pooled.engine.setMetadata(voiceId, EDGE_FORMAT);
+      pooled.voiceId = voiceId;
+      console.log(`[tts] connection set to voice: ${voiceId}`);
+    } catch (err) {
+      closeEngine(pooled);
+      throw err;
+    }
+  }
+  return pooled;
 }
 
-// ─── Global TTS semaphore ─────────────────────────────────────────────────────
-// ONE synthesis at a time. Held for the entire textToMp3File call (all retries).
-let ttsInFlight = false;
+function checkinEngine(p: PooledEngine): void {
+  idleEngines.push(p);
+  while (idleEngines.length > MAX_CONCURRENT) closeEngine(idleEngines.shift()!);
+}
+
+let ttsActive = 0;
 const ttsQueue: Array<() => void> = [];
 
 async function acquireTts(): Promise<void> {
-  if (!ttsInFlight) { ttsInFlight = true; return; }
-  await new Promise<void>((resolve) => ttsQueue.push(resolve));
+  if (ttsActive < MAX_CONCURRENT) { ttsActive++; return; }
+  await new Promise<void>((resolve) => ttsQueue.push(resolve));     // slot is handed over, count stays
 }
 
 function releaseTts(): void {
   const next = ttsQueue.shift();
-  if (next) { next(); } else { ttsInFlight = false; }
+  if (next) next(); else ttsActive--;
 }
 
 // ─── Low-level synthesis ──────────────────────────────────────────────────────
 
 async function synthesize(text: string, voiceId: string, filePath: string): Promise<void> {
-  const engine = await getEngine(voiceId);
-
-  await Promise.race([
-    new Promise<void>((resolve, reject) => {
-      // toStream() uses the voice already set via setMetadata() above.
-      // The engine's voice matches voiceId — no SSML tricks needed.
-      // The Edge API takes SSML, so & < > in the text must be escaped
-      const safe = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-      const { audioStream } = engine.toStream(safe);
-      const chunks: Buffer[] = [];
-      audioStream.on("data", (c: Buffer) => chunks.push(c));
-      audioStream.on("end", async () => {
-        try {
-          const buf = Buffer.concat(chunks);
-          if (buf.length === 0) { reject(new Error("Empty audio buffer")); return; }
-          await writeFile(filePath, buf);
-          resolve();
-        } catch (e) { reject(e); }
-      });
-      audioStream.on("error", reject);
-    }),
-    new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error(`TTS timed out after ${TIMEOUT_MS}ms`)), TIMEOUT_MS)
-    ),
-  ]);
+  const pooled = await checkoutEngine(voiceId);
+  let ok = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      new Promise<void>((resolve, reject) => {
+        // The Edge API takes SSML, so & < > in the text must be escaped
+        const safe = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+        const { audioStream } = pooled.engine.toStream(safe);
+        const chunks: Buffer[] = [];
+        audioStream.on("data", (c: Buffer) => chunks.push(c));
+        audioStream.on("end", async () => {
+          try {
+            const buf = Buffer.concat(chunks);
+            if (buf.length === 0) { reject(new Error("Empty audio buffer")); return; }
+            await writeFile(filePath, buf);
+            resolve();
+          } catch (e) { reject(e); }
+        });
+        audioStream.on("error", reject);
+      }),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`TTS timed out after ${TIMEOUT_MS}ms`)), TIMEOUT_MS);
+      }),
+    ]);
+    ok = true;
+  } finally {
+    if (timer) clearTimeout(timer);
+    if (ok) checkinEngine(pooled); else closeEngine(pooled);       // a failed connection is never reused
+  }
 }
 
 // ─── Bing / Edge synthesis (caller must hold the semaphore) ──────────────────
@@ -115,11 +127,9 @@ async function edgeToFile(clean: string, voice: VoiceOption): Promise<string> {
     } catch (err) {
       lastErr = err as Error;
       await unlink(filePath).catch(() => {});
-      // Invalidate the shared engine — stale or rate-limited connection.
-      // Next attempt creates a fresh WebSocket with the correct voice.
-      invalidateEngine();
+      // (the failed connection was already dropped; the next attempt gets a fresh one)
       console.warn(`[tts] attempt ${attempt}/3 failed (${voice.id}): ${lastErr.message}`);
-      if (attempt < 3) await sleep(2_000);
+      if (attempt < 3) await sleep(700);
     }
   }
   throw lastErr;
@@ -182,6 +192,9 @@ export async function textToMp3File(
 ): Promise<string> {
   const clean = sanitizeText(text);
   if (!clean) throw new Error("Text is empty after sanitisation");
+
+  // Nothing to say (e.g. "……" or stray symbols): a voice would return empty audio and count as a failure
+  if (!/[\p{L}\p{N}]/u.test(clean)) return await silenceFile(0.3);
 
   await acquireTts();
   try {
