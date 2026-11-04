@@ -31,6 +31,7 @@ import { changeTempo, toOpusOgg, opusEnabled } from "./media.js";
 import { planParagraphs, markerChunk, parseMarkerChunk, markerToFile, MARKER_MODES } from "./markers.js";
 import type { MarkerMode, NotesMode } from "./markers.js";
 import { EXPRESSION_LEVELS } from "./expressive.js";
+import { tidyChapter } from "./gaps.js";
 import type { ExpressionLevel } from "./expressive.js";
 import type { ChapterSection } from "./scraper.js";
 
@@ -344,6 +345,12 @@ export async function startReading(
   resumeFromChunk  = 0,
   userId           = "",
 ): Promise<void> {
+  // Drop blank/invisible gaps and collapse repeated ones so playback never sits in silence
+  const tidied = tidyChapter(paragraphs, sections);
+  if (tidied.removed > 0) console.log(`[gaps] removed ${tidied.removed} blank or repeated gap paragraph(s) from "${title}"`);
+  paragraphs = tidied.paragraphs;
+  sections   = tidied.sections;
+
   if (paragraphs.length === 0) throw new Error("There is nothing to read.");
   await stopSession(guild.id);
 

@@ -208,7 +208,7 @@ export async function textToMp3File(
 ): Promise<string> {
   const level: ExpressionLevel = opts.expression ?? "off";
   const clean = sanitizeText(text);
-  if (!clean) throw new Error("Text is empty after sanitisation");
+  if (!clean) return await silenceFile(0.15);          // nothing to say — a moment of silence, not a failure
 
   // Nothing to say (e.g. "……" or stray symbols): a voice would return empty audio and count as a failure
   if (!/[\p{L}\p{N}]/u.test(clean)) return await silenceFile(0.3);
