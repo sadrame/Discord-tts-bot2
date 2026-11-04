@@ -20,6 +20,9 @@ The player has 🐢 Slower / 🐇 Faster buttons, and **⚙️ Custom…** opens
 ## Links it can read
 Web chapters (WCT, AO3…), public Google Docs, and direct **.pdf / .txt** links such as archive.org downloads. For PDFs the bot rebuilds paragraphs, removes running headers and page numbers, rejoins hyphenated words and turns "Chapter N" lines into chapters you can jump to with `/chapter`. Big books: it reads 250 pages at a time by default; add `#pages=1-80` (or `#page=120`) to the end of the link to choose where to start. Scanned PDFs (pictures of text) can't be read. Bullet and numbered lists on web pages are read item by item. Env: `MAX_PDF_PAGES` (default 250), `MAX_PDF_MB` (default 80).
 
+## Gaps
+Blank spacing never makes the bot go quiet. Empty paragraphs — including ones filled with invisible characters (zero-width spaces, braille blanks) — are skipped, runs of the same gap collapse to one (five `……` lines → one short pause, two `△▼△▼` → one scene break), extra spaces/newlines inside a paragraph become one space, and `........` becomes `...`. It's automatic for every source (web pages, Google Docs, PDFs).
+
 ## Expressive Bing voices
 `/expression off|normal|strong` — WORDS IN CAPS are louder and higher, `!` makes a sentence louder and quicker, `?` raises the pitch, `...` trails off slower, and stretched words like "Noooo" are drawn out. Bing voices only (ElevenLabs voices already do this themselves). If Bing ever rejects a styled request the bot falls back to plain reading automatically. `EXPRESSION=off` disables it for the whole bot.
 
