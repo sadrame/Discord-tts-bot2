@@ -63,6 +63,8 @@ import {
 } from "./voice.js";
 import type { GuildPrefs } from "./voice.js";
 import { MARKER_MODES } from "./markers.js";
+import { EXPRESSION_LEVELS } from "./expressive.js";
+import type { ExpressionLevel } from "./expressive.js";
 import type { MarkerMode } from "./markers.js";
 import { getBookmark } from "./bookmarks.js";
 import { VOICES } from "./voices.js";
@@ -114,6 +116,7 @@ function helpText(): string {
     "`/rewind [amount]` · `/forward [amount]` — jump back/ahead, e.g. `30`, `1m`, `1m30s` (default: your skip step)",
     "`/skipstep <seconds>` — change the default ⏪/⏩ step",
     "`/markers [style] [notes]` — how scene breaks (△▼△▼) and ※ dividers are announced: chime, voice, both or off; and whether to skip translator's notes",
+    "`/expression <off|normal|strong>` — Bing voices: CAPS get louder, ! and ? change the delivery, … trails off",
     "`/chapter <n>` — jump to chapter/section N",
     "`/chapters` — list all detected chapters in the current reading",
     "`/restart` — restart the chapter from the beginning",
@@ -496,6 +499,15 @@ async function handleMarkers(guildId: string, style: string | null, notes: strin
   return lines.join("\n");
 }
 
+async function handleExpression(guildId: string, level: string | null): Promise<string> {
+  await hydrateGuildVoice(guildId);
+  if (level && EXPRESSION_LEVELS.includes(level as ExpressionLevel)) {
+    const p = setPrefs(guildId, { expression: level as ExpressionLevel });
+    return `🎭 Expression: **${p.expression}** — applies to sentences generated from now on (a few seconds ahead). Bing voices only; ElevenLabs voices already react to CAPS and punctuation themselves.`;
+  }
+  return `🎭 Expression is **${getPrefs(guildId).expression}**. Set it with \`/expression level:off|normal|strong\`.`;
+}
+
 /** Text-prefix versions of the playback commands. Returns null if it isn't one of them. */
 async function handlePrefixPlayback(guildId: string, command: string, args: string[]): Promise<string | null> {
   switch (command) {
@@ -512,6 +524,8 @@ async function handlePrefixPlayback(guildId: string, command: string, args: stri
       return handleMove(guildId, -1, args.join(""));
     case "forward": case "ff": case "fastforward":
       return handleMove(guildId, 1, args.join(""));
+    case "expression":
+      return handleExpression(guildId, args[0]?.toLowerCase() ?? null);
     case "markers": {
       const style = args.find((a) => MARKER_MODES.includes(a.toLowerCase() as MarkerMode))?.toLowerCase() ?? null;
       const notes = args.find((a) => a.toLowerCase() === "skip" || a.toLowerCase() === "read")?.toLowerCase() ?? null;
@@ -744,6 +758,9 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
       case "rewind":   await editReply(handleMove(guildId, -1, cmd.options.getString("amount"))); break;
       case "forward":  await editReply(handleMove(guildId, +1, cmd.options.getString("amount"))); break;
       case "skipstep": await editReply(await handleSkipStep(guildId, cmd.options.getInteger("seconds", true))); break;
+      case "expression":
+        await editReply(await handleExpression(guildId, cmd.options.getString("level")));
+        break;
       case "markers":
         await editReply(await handleMarkers(guildId, cmd.options.getString("style"), cmd.options.getString("notes")));
         break;
@@ -823,7 +840,7 @@ client.on(Events.MessageCreate, async (message: Message) => {
           break;
         }
         case "chapters": reply = handleChapters(guildId); break;
-        case "speed": case "rewind": case "rw": case "forward": case "ff": case "fastforward": case "skipstep": case "markers":
+        case "speed": case "rewind": case "rw": case "forward": case "ff": case "fastforward": case "skipstep": case "markers": case "expression":
           reply = (await handlePrefixPlayback(guildId, command, args)) ?? "";
           break;
         case "seek": {
@@ -893,7 +910,7 @@ client.on(Events.MessageCreate, async (message: Message) => {
         break;
       }
       case "chapters": reply = handleChapters(guildId); break;
-      case "speed": case "rewind": case "rw": case "forward": case "ff": case "fastforward": case "skipstep": case "markers":
+      case "speed": case "rewind": case "rw": case "forward": case "ff": case "fastforward": case "skipstep": case "markers": case "expression":
         reply = (await handlePrefixPlayback(guildId, command, args)) ?? "";
         break;
       case "restart":  reply = handleRestart(guildId);    break;

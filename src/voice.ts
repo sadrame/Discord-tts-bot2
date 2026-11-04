@@ -30,6 +30,8 @@ import { saveBookmark, clearBookmark } from "./bookmarks.js";
 import { changeTempo, toOpusOgg, opusEnabled } from "./media.js";
 import { planParagraphs, markerChunk, parseMarkerChunk, markerToFile, MARKER_MODES } from "./markers.js";
 import type { MarkerMode, NotesMode } from "./markers.js";
+import { EXPRESSION_LEVELS } from "./expressive.js";
+import type { ExpressionLevel } from "./expressive.js";
 import type { ChapterSection } from "./scraper.js";
 
 // How long to wait for Discord's voice handshake. Render's free tier can be slow,
@@ -124,11 +126,12 @@ export interface GuildPrefs {
   seekStep:  number;   // seconds moved by ⏪/⏩ and /rewind /forward when no amount is given
   markers:   MarkerMode;  // how ※ / △▼ dividers are announced: chime, voice, both or off
   notes:     NotesMode;   // "skip" leaves out translator's notes (applies when a chapter starts)
+  expression: ExpressionLevel; // Bing voices: how much CAPS / ! / ? / … change the delivery
 }
 
 export const SPEED_MIN = 0.5;
 export const SPEED_MAX = 3.0;
-const DEFAULT_PREFS: GuildPrefs = { speed: 1, speedStep: 0.25, seekStep: 10, markers: "chime", notes: "read" };
+const DEFAULT_PREFS: GuildPrefs = { speed: 1, speedStep: 0.25, seekStep: 10, markers: "chime", notes: "read", expression: "normal" };
 const guildPrefs = new Map<string, GuildPrefs>();
 
 export function getPrefs(guildId: string): GuildPrefs {
@@ -151,6 +154,7 @@ export function setPrefs(guildId: string, patch: Partial<GuildPrefs>): GuildPref
   if (patch.seekStep  !== undefined && Number.isFinite(patch.seekStep))  next.seekStep  = Math.round(clamp(patch.seekStep, 3, 300));
   if (patch.markers   !== undefined && MARKER_MODES.includes(patch.markers)) next.markers = patch.markers;
   if (patch.notes === "read" || patch.notes === "skip") next.notes = patch.notes;
+  if (patch.expression !== undefined && EXPRESSION_LEVELS.includes(patch.expression)) next.expression = patch.expression;
   guildPrefs.set(guildId, next);
   kvSet(`wct:prefs:${guildId}`, JSON.stringify(next), 60 * 60 * 24 * 365).catch(() => {});
 
@@ -193,6 +197,7 @@ export async function hydrateGuildVoice(guildId: string): Promise<void> {
           seekStep:  clamp(Number(p.seekStep)  || DEFAULT_PREFS.seekStep,  3, 300),
           markers:   MARKER_MODES.includes(p.markers as MarkerMode) ? (p.markers as MarkerMode) : DEFAULT_PREFS.markers,
           notes:     p.notes === "skip" ? "skip" : "read",
+          expression: EXPRESSION_LEVELS.includes(p.expression as ExpressionLevel) ? (p.expression as ExpressionLevel) : DEFAULT_PREFS.expression,
         });
       }
     }
@@ -880,7 +885,7 @@ async function generateChunk(session: ReadSession): Promise<ChunkResult | null> 
         const marker = parseMarkerChunk(text);
         const file   = marker
           ? await markerToFile(marker, getPrefs(session.guildId).markers, voice)
-          : await textToMp3File(text, voice);
+          : await textToMp3File(text, voice, { expression: getPrefs(session.guildId).expression });
 
         // Encode for playback now, while the previous clip is still playing
         const speed    = session.speed;

@@ -1,5 +1,6 @@
 import axios from "axios";
 import * as cheerio from "cheerio";
+import { scrapeFileUrl } from "./pdftext.js";
 
 export interface ChapterSection {
   title: string;
@@ -75,6 +76,20 @@ interface ExtractResult {
   sections: ChapterSection[];
 }
 
+/** Text of a bullet/numbered item (its own text only — nested lists and <p> children are read separately). */
+function listItemText($: cheerio.CheerioAPI, el: any): string {
+  const item = $(el);
+  if (item.find("p, h1, h2, h3, h4, h5, h6").length > 0) return "";
+  const own = cleanText(item.clone().find("ul, ol").remove().end().text());
+  if (!own) return "";
+  const list = item.parent();
+  if (list.is("ol")) {
+    const start = parseInt(list.attr("start") ?? "1", 10) || 1;
+    return `${start + item.prevAll("li").length}. ${own}`;
+  }
+  return own;
+}
+
 function extractParagraphs(
   $: cheerio.CheerioAPI,
   contentEl: cheerio.Cheerio<any>,
@@ -84,7 +99,7 @@ function extractParagraphs(
   const sections: ChapterSection[] = [];
   let partCounter = 0;
 
-  contentEl.find(opts.includeListItems ? "p, li, h1, h2, h3, h4, h5, h6, hr" : "p, h1, h2, h3, h4, h5, h6, hr").each((_, el) => {
+  contentEl.find("p, li, h1, h2, h3, h4, h5, h6, hr").each((_, el) => {
     const tag = (el as any).tagName?.toLowerCase() ?? "";
     if (SKIP_TAGS.has(tag)) return;
 
@@ -97,7 +112,7 @@ function extractParagraphs(
       return;
     }
 
-    const text = cleanText($(el).text());
+    const text = tag === "li" ? listItemText($, el) : cleanText($(el).text());
     if (!text) return;
 
     // Heading = named chapter/section boundary
@@ -260,6 +275,9 @@ async function scrapeGoogleDoc(url: string, fetchUrl: string): Promise<ScrapedCh
 export async function scrapeChapter(url: string): Promise<ScrapedChapter> {
   const gdoc = googleDocUrl(url);
   if (gdoc) return scrapeGoogleDoc(url, gdoc.fetchUrl);
+
+  const file = await scrapeFileUrl(url);          // direct .pdf / .txt links
+  if (file) return file;
 
   const hostname = new URL(url).hostname.replace("www.", "");
   const extra    = extraConfig(hostname);

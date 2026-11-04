@@ -56,6 +56,16 @@ export const slashCommands = [
           { name: "Read them",  value: "read" },
           { name: "Skip them",  value: "skip" },
         )),
+  new SlashCommandBuilder()
+    .setName("expression")
+    .setDescription("Bing voices: how much CAPS, ! and ? change the delivery (louder, higher, slower)")
+    .addStringOption((o) =>
+      o.setName("level").setDescription("Expression level").setRequired(true)
+        .addChoices(
+          { name: "Off (flat)",                value: "off" },
+          { name: "Normal",                    value: "normal" },
+          { name: "Strong (more dramatic)",    value: "strong" },
+        )),
   new SlashCommandBuilder().setName("chapters").setDescription("List detected chapters in the current reading"),
   new SlashCommandBuilder().setName("restart").setDescription("Restart from the beginning"),
   new SlashCommandBuilder()

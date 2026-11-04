@@ -6,6 +6,8 @@ import { randomUUID } from "crypto";
 import type { VoiceOption } from "./voices.js";
 import { DEFAULT_VOICE } from "./voices.js";
 import { elevenSynthesize, ElevenError } from "./eleven.js";
+import { expressiveBody } from "./expressive.js";
+import type { ExpressionLevel } from "./expressive.js";
 import { splitWithSfx, softenShouting, getSfxFile, FALLBACK_SPEECH, SFX_ENABLED } from "./sfx.js";
 import type { Segment } from "./sfx.js";
 import { concatAudio, silenceFile } from "./media.js";
@@ -80,7 +82,7 @@ function releaseTts(): void {
 
 // ─── Low-level synthesis ──────────────────────────────────────────────────────
 
-async function synthesize(text: string, voiceId: string, filePath: string): Promise<void> {
+async function synthesize(text: string, voiceId: string, filePath: string, rawSsml = false): Promise<void> {
   const pooled = await checkoutEngine(voiceId);
   let ok = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -88,7 +90,7 @@ async function synthesize(text: string, voiceId: string, filePath: string): Prom
     await Promise.race([
       new Promise<void>((resolve, reject) => {
         // The Edge API takes SSML, so & < > in the text must be escaped
-        const safe = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+        const safe = rawSsml ? text : text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
         const { audioStream } = pooled.engine.toStream(safe);
         const chunks: Buffer[] = [];
         audioStream.on("data", (c: Buffer) => chunks.push(c));
@@ -115,20 +117,36 @@ async function synthesize(text: string, voiceId: string, filePath: string): Prom
 
 // ─── Bing / Edge synthesis (caller must hold the semaphore) ──────────────────
 
-async function edgeToFile(clean: string, voice: VoiceOption): Promise<string> {
+// If the Bing service rejects expressive (SSML) requests, stop sending them for a while and read plain text instead
+let ssmlFailures = 0;
+let ssmlPausedUntil = 0;
+const ssmlAllowed = (): boolean => Date.now() >= ssmlPausedUntil && (process.env["EXPRESSION"] ?? "on").toLowerCase() !== "off";
+
+async function edgeToFile(raw: string, voice: VoiceOption, level: ExpressionLevel = "off"): Promise<string> {
+  const plain = sanitizeText(softenShouting(raw));
+  let body: string | null = ssmlAllowed() ? expressiveBody(sanitizeText(raw), level) : null;
   let lastErr: Error = new Error("Unknown TTS error");
 
   for (let attempt = 1; attempt <= 3; attempt++) {
     const filePath = join(tmpdir(), `wct-tts-${randomUUID()}.mp3`);
     try {
-      console.log(`[tts] voice=${voice.id} attempt=${attempt} len=${clean.length}`);
-      await synthesize(clean, voice.id, filePath);
+      console.log(`[tts] voice=${voice.id} attempt=${attempt} len=${plain.length}${body ? " expressive" : ""}`);
+      await synthesize(body ?? plain, voice.id, filePath, body !== null);
+      if (body !== null) ssmlFailures = 0;
       return filePath; // ✅
     } catch (err) {
       lastErr = err as Error;
       await unlink(filePath).catch(() => {});
       // (the failed connection was already dropped; the next attempt gets a fresh one)
       console.warn(`[tts] attempt ${attempt}/3 failed (${voice.id}): ${lastErr.message}`);
+      if (body !== null) {
+        body = null;                                   // retry this one as plain text
+        if (++ssmlFailures >= 3) {
+          ssmlFailures = 0;
+          ssmlPausedUntil = Date.now() + 10 * 60_000;
+          console.warn("[tts] expressive requests keep failing — reading plain text for 10 minutes");
+        }
+      }
       if (attempt < 3) await sleep(700);
     }
   }
@@ -136,15 +154,14 @@ async function edgeToFile(clean: string, voice: VoiceOption): Promise<string> {
 }
 
 /** Speak the text parts, drop in sound clips for the reactions, and stitch it all into one mp3. */
-async function edgeWithSfx(segments: Segment[], plainText: string, voice: VoiceOption): Promise<string> {
+async function edgeWithSfx(segments: Segment[], plainText: string, voice: VoiceOption, level: ExpressionLevel = "off"): Promise<string> {
   const parts: AudioPart[] = [];
   const temps: string[]    = [];
   try {
     for (const seg of segments) {
       if (seg.type === "text") {
-        const t = sanitizeText(softenShouting(seg.text));
-        if (!/[\p{L}\p{N}]/u.test(t)) continue;
-        const f = await edgeToFile(t, voice);
+        if (!/[\p{L}\p{N}]/u.test(seg.text)) continue;
+        const f = await edgeToFile(seg.text, voice, level);
         temps.push(f); parts.push({ file: f });
         continue;
       }
@@ -169,7 +186,7 @@ async function edgeWithSfx(segments: Segment[], plainText: string, voice: VoiceO
       return await concatAudio(parts);
     } catch (err) {
       console.warn(`[tts] couldn't mix sound effects (${(err as Error).message}) — reading the text instead`);
-      return await edgeToFile(sanitizeText(softenShouting(plainText)), voice);
+      return await edgeToFile(plainText, voice, level);
     }
   } finally {
     await Promise.all(temps.map((f) => cleanupFile(f)));
@@ -181,15 +198,15 @@ async function edgeWithSfx(segments: Segment[], plainText: string, voice: VoiceO
 /**
  * Convert text to an MP3 temp file.
  *
- * Uses a single shared WebSocket. When the voice changes, setMetadata()
- * triggers exactly ONE reconnect — safe and not rate-limited. On failure,
- * the engine is invalidated and reconnected fresh on the next attempt.
- * The global semaphore ensures only one synthesis is in-flight at a time.
+ * Uses a small pool of WebSocket connections (see "Engine pool" above) so several servers can
+ * synthesize at once. `opts.expression` adds emotion for Bing voices (CAPS, !, ?, …).
  */
 export async function textToMp3File(
   text: string,
   voice: VoiceOption = DEFAULT_VOICE,
+  opts: { expression?: ExpressionLevel } = {},
 ): Promise<string> {
+  const level: ExpressionLevel = opts.expression ?? "off";
   const clean = sanitizeText(text);
   if (!clean) throw new Error("Text is empty after sanitisation");
 
@@ -221,9 +238,9 @@ export async function textToMp3File(
     // ── Bing / Edge voices (with reactions: screams, screeches, scratches…) ──
     const segments: Segment[] = SFX_ENABLED ? splitWithSfx(clean) : [{ type: "text", text: clean }];
     if (segments.length === 1 && segments[0]!.type === "text") {
-      return await edgeToFile(sanitizeText(softenShouting(clean)), voice);
+      return await edgeToFile(clean, voice, level);
     }
-    return await edgeWithSfx(segments, clean, voice);
+    return await edgeWithSfx(segments, clean, voice, level);
   } finally {
     releaseTts();
   }
