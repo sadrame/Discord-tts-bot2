@@ -109,7 +109,7 @@ function inviteUrl(): string {
   return `https://discord.com/oauth2/authorize?client_id=${clientId}&permissions=3237889&scope=bot+applications.commands`;
 }
 
-function helpLines(): string {
+function helpText(): string {
   return [
     "📖 **WCT Reader Bot**",
     "",
@@ -146,11 +146,6 @@ function helpLines(): string {
     "Supports WitchCultTranslations, AO3 and public Google Docs links.",
     "Your position is saved when you `!stop` — re-reading the same URL resumes automatically.",
   ].join("\n");
-
-function helpPayload(): { embeds: EmbedBuilder[] } {
-  const text = helpLines();
-  return { embeds: [new EmbedBuilder().setColor(0x5865f2).setDescription(text.length > 4000 ? text.slice(0, 3990) + "…" : text)] };
-}
 }
 
 async function safeSend(channel: TextChannel | null | undefined, content: string): Promise<void> {
@@ -847,7 +842,7 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
         break;
       }
       case "progress": await editReply(handleProgress(guildId));   break;
-      case "help":     await cmd.editReply(helpPayload()).catch(() => {});                break;
+      case "help":     await editReply(helpText());                break;
       case "invite":   await editReply(`🔗 **Add me to your server:**\n${inviteUrl()}`); break;
 
       case "voice":
@@ -885,7 +880,7 @@ client.on(Events.MessageCreate, async (message: Message) => {
   // ── DM / group-chat handling ──────────────────────────────────────────────
   if (inDM) {
     if (command === "help") {
-      try { await message.reply(helpPayload()); } catch { /* ignore */ }
+      try { await message.reply(helpText()); } catch { /* ignore */ }
       return;
     }
 
@@ -1020,10 +1015,7 @@ client.on(Events.MessageCreate, async (message: Message) => {
       }
       case "progress": reply = handleProgress(guildId);   break;
       case "invite":   reply = `🔗 **Add me to your server:**\n${inviteUrl()}`; break;
-      case "help": {
-        try { await message.reply(helpPayload()); } catch (err) { console.error("[prefix help]", err); }
-        return;
-      }
+      case "help":     reply = helpText();                break;
       default: return;
     }
   } catch (err) {
