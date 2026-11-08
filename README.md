@@ -3,7 +3,7 @@
 Discord bot that joins your voice channel and reads web-novel chapters (WCT, AO3) and public Google Docs aloud using Microsoft Edge neural TTS.
 
 ## Commands (slash or `!` prefix)
-`read <url>` · `join` · `stop` · `pause` · `resume` · `skip` (next paragraph) · `find <text>` · `chapter <n>` · `chapters` · `restart` · `seek <sec>` · `progress` · `speed` · `rewind` · `forward` · `skipstep` · `markers` · `expression` · `voice` · `voicesearch` · `invite` · `help`
+`read <url>` · `join` · `stop` · `pause` · `resume` · `skip` (next paragraph) · `find <text>` · `chapter <n>` · `chapters` · `restart` · `seek <sec>` · `progress` · `speed` · `rewind` · `forward` · `skipstep` · `queue` · `skip` · `previous` · `controls` · `markers` · `expression` · `voice` · `voicesearch` · `invite` · `help`
 
 `find` is typo-tolerant ("wietz" finds "Weitz"). It shows the match with ⬅️ ➡️ to browse and **Go to this** to jump — nothing jumps until you tap it.
 
@@ -16,6 +16,17 @@ Every voice shows the plan it needs (🆓 Free, 💳 Starter+/Creator+/Paid), an
 
 ## Speed, rewind and fast-forward
 The player has 🐢 Slower / 🐇 Faster buttons, and **⚙️ Custom…** opens a popup to set the exact speed, the speed-button step and the skip step. `/speed 1.25` sets it directly (0.5×–3×). `/rewind` and `/forward` move by your skip step, or by an amount: `/forward 30`, `/rewind 1m30s`. `/skipstep 15` changes the default. Speed changes apply from the next sentence and are remembered per server.
+
+## Queue
+`/read <url>` plays right away if nothing is playing, otherwise adds the link to the queue; links then play one after another without the bot leaving the channel. `/queue` shows it Jockie-style (page, `[mm:ss]`, linked titles, a "Make a selection" menu to play now / play next / remove, and you can also type `next page`, `previous page`, `go to page 3` or `cancel`). `/skip` skips the current link, `/previous` goes back, `/remove <n>`, `/clear`, and `/skipparagraph` skips just the paragraph. `/stop` clears everything.
+
+**Controls:** by default the person who started the queue, whoever queued the link that's playing, and people with Manage Server can skip/pause/seek/stop. Everyone can add links and view the queue. If the owner leaves the voice channel, anyone in it can steer. `/controls open` lets everyone control (Manage Server or the owner can switch it).
+
+## Japanese
+Japanese text (kana/kanji) inside a chapter is read aloud in Japanese by a Japanese Bing voice matching the current voice's gender — not translated. ElevenLabs voices read Japanese themselves.
+
+## Images
+A picture on the page is announced as "Image file." (no sound or marker). Emoji, icons and avatars are ignored.
 
 ## Links it can read
 Web chapters (WCT, AO3…), public Google Docs, and direct **.pdf / .txt** links such as archive.org downloads. For PDFs the bot rebuilds paragraphs, removes running headers and page numbers, rejoins hyphenated words and turns "Chapter N" lines into chapters you can jump to with `/chapter`. Big books: it reads 250 pages at a time by default; add `#pages=1-80` (or `#page=120`) to the end of the link to choose where to start. Scanned PDFs (pictures of text) can't be read. Bullet and numbered lists on web pages are read item by item. Env: `MAX_PDF_PAGES` (default 250), `MAX_PDF_MB` (default 80).
