@@ -128,11 +128,12 @@ export interface GuildPrefs {
   markers:   MarkerMode;  // how ※ / △▼ dividers are announced: chime, voice, both or off
   notes:     NotesMode;   // "skip" leaves out translator's notes (applies when a chapter starts)
   expression: ExpressionLevel; // Bing voices: how much CAPS / ! / ? / … change the delivery
+  controls:  "restricted" | "open";   // who may skip/pause/seek: owner + requester + managers, or everyone
 }
 
 export const SPEED_MIN = 0.5;
 export const SPEED_MAX = 3.0;
-const DEFAULT_PREFS: GuildPrefs = { speed: 1, speedStep: 0.25, seekStep: 10, markers: "chime", notes: "read", expression: "normal" };
+const DEFAULT_PREFS: GuildPrefs = { speed: 1, speedStep: 0.25, seekStep: 10, markers: "chime", notes: "read", expression: "normal", controls: "restricted" };
 const guildPrefs = new Map<string, GuildPrefs>();
 
 export function getPrefs(guildId: string): GuildPrefs {
@@ -156,6 +157,7 @@ export function setPrefs(guildId: string, patch: Partial<GuildPrefs>): GuildPref
   if (patch.markers   !== undefined && MARKER_MODES.includes(patch.markers)) next.markers = patch.markers;
   if (patch.notes === "read" || patch.notes === "skip") next.notes = patch.notes;
   if (patch.expression !== undefined && EXPRESSION_LEVELS.includes(patch.expression)) next.expression = patch.expression;
+  if (patch.controls === "restricted" || patch.controls === "open") next.controls = patch.controls;
   guildPrefs.set(guildId, next);
   kvSet(`wct:prefs:${guildId}`, JSON.stringify(next), 60 * 60 * 24 * 365).catch(() => {});
 
@@ -198,6 +200,7 @@ export async function hydrateGuildVoice(guildId: string): Promise<void> {
           seekStep:  clamp(Number(p.seekStep)  || DEFAULT_PREFS.seekStep,  3, 300),
           markers:   MARKER_MODES.includes(p.markers as MarkerMode) ? (p.markers as MarkerMode) : DEFAULT_PREFS.markers,
           notes:     p.notes === "skip" ? "skip" : "read",
+          controls:  p.controls === "open" ? "open" : "restricted",
           expression: EXPRESSION_LEVELS.includes(p.expression as ExpressionLevel) ? (p.expression as ExpressionLevel) : DEFAULT_PREFS.expression,
         });
       }
@@ -311,13 +314,22 @@ export async function saveAllBookmarks(): Promise<void> {
   await Promise.all([...sessions.values()].map((s) => persistBookmark(s)));
 }
 
+export type SessionFinishedHook = (session: ReadSession) => Promise<boolean>;
+let finishedHook: SessionFinishedHook | null = null;
+/** Called when a chapter ends on its own. Return true if you started something else (queue). */
+export function setSessionFinishedHook(hook: SessionFinishedHook | null): void { finishedHook = hook; }
+
+function safeUrl(u: string): string | null {
+  return /^https?:\/\/\S+$/.test(u) ? u : null;
+}
+
 // ─── Session lifecycle ────────────────────────────────────────────────────────
 
 export function getSession(guildId: string): ReadSession | undefined {
   return sessions.get(guildId);
 }
 
-export async function stopSession(guildId: string): Promise<void> {
+export async function stopSession(guildId: string, keepConnection = false): Promise<void> {
   clearStandby(guildId);
   const session = sessions.get(guildId);
   if (session) {
@@ -331,7 +343,7 @@ export async function stopSession(guildId: string): Promise<void> {
     await persistBookmark(session);
   }
   sessions.delete(guildId);
-  destroyConnection(guildId);
+  if (!keepConnection) destroyConnection(guildId);
 }
 
 export async function startReading(
@@ -344,6 +356,7 @@ export async function startReading(
   sections:        ChapterSection[] = [],
   resumeFromChunk  = 0,
   userId           = "",
+  opts: { reuseConnection?: boolean } = {},
 ): Promise<void> {
   // Drop blank/invisible gaps and collapse repeated ones so playback never sits in silence
   const tidied = tidyChapter(paragraphs, sections);
@@ -352,7 +365,7 @@ export async function startReading(
   sections   = tidied.sections;
 
   if (paragraphs.length === 0) throw new Error("There is nothing to read.");
-  await stopSession(guild.id);
+  await stopSession(guild.id, opts.reuseConnection === true);
 
   // Build chunks and map paragraph → first chunk index (for chapter boundaries)
   const allChunks: string[] = [];
@@ -454,7 +467,10 @@ export async function startReading(
 
   let connection: VoiceConnection;
   try {
-    connection = await connectToChannel(guild, voiceChannel);
+    const existing = opts.reuseConnection ? getVoiceConnection(guild.id) : undefined;
+    connection = existing && existing.state.status === VoiceConnectionStatus.Ready
+      ? existing                                         // moving to the next queued link: stay in the channel
+      : await connectToChannel(guild, voiceChannel);
   } catch (err) {
     await stopSession(guild.id);
     throw err;
@@ -572,7 +588,7 @@ function buildEmbed(session: ReadSession, voice: VoiceOption, loading = false): 
   if (loading) {
     return new EmbedBuilder()
       .setColor(EMBED_COLOR_LOADING)
-      .setTitle(`📖 ${session.title}`)
+      .setTitle(`📖 ${session.title}`).setURL(safeUrl(session.url))
       .setDescription(`${"░".repeat(BAR_WIDTH)}\n⏳ Loading chapter...`)
       .addFields({ name: "🎙️ Voice", value: `${flag} ${voiceDisplay(voice)}`, inline: true });
   }
@@ -597,7 +613,7 @@ function buildEmbed(session: ReadSession, voice: VoiceOption, loading = false): 
 
   const embed = new EmbedBuilder()
     .setColor(color)
-    .setTitle(`📖 ${session.title}`)
+    .setTitle(`📖 ${session.title}`).setURL(safeUrl(session.url))
     .setDescription(`${bar}\n${timeStr} · ${statusLine}`)
     .addFields(
       { name: "🎙️ Voice",     value: `${flag} ${voiceDisplay(voice)}`,                       inline: true },
@@ -722,7 +738,7 @@ async function finalizeProgress(session: ReadSession, stopped = false): Promise<
     const bar = "▓".repeat(filled) + "░".repeat(BAR_WIDTH - filled);
     const embed = new EmbedBuilder()
       .setColor(EMBED_COLOR_STOPPED)
-      .setTitle(`📖 ${session.title}`)
+      .setTitle(`📖 ${session.title}`).setURL(safeUrl(session.url))
       .setDescription(`${bar}\n⏹️ Stopped at **${fmt(Math.min(elapsed, total))}** / ~${fmt(total)}`)
       .addFields({ name: "🎙️ Voice", value: `${flag} ${voiceDisplay(voice)}`, inline: true });
     try { await session.progressMsg.edit({ embeds: [embed], components: [] }); } catch { /* ignore */ }
@@ -731,7 +747,7 @@ async function finalizeProgress(session: ReadSession, stopped = false): Promise<
 
   const embed = new EmbedBuilder()
     .setColor(EMBED_COLOR_DONE)
-    .setTitle(`📖 ${session.title}`)
+    .setTitle(`📖 ${session.title}`).setURL(safeUrl(session.url))
     .setDescription(`${"▓".repeat(BAR_WIDTH)}\n✅ Finished! **${fmt(total)}**`)
     .addFields({ name: "🎙️ Voice", value: `${flag} ${voiceDisplay(voice)}`, inline: true });
   try { await session.progressMsg.edit({ embeds: [embed], components: [] }); } catch { /* ignore */ }
@@ -863,7 +879,10 @@ async function runPipeline(session: ReadSession): Promise<void> {
 
   if (!session.stopped) {
     if (session.userId) await clearBookmark(session.userId, session.url).catch(() => {});
-    await stopSession(session.guildId);
+    let handled = false;                                 // the queue may start the next link and keep the connection
+    try { handled = finishedHook ? await finishedHook(session) : false; }
+    catch (err) { console.error("[queue] finish hook failed:", err); }
+    if (!handled) await stopSession(session.guildId);
   }
 }
 

@@ -25,6 +25,8 @@ import {
   VoiceBasedChannel,
   Guild,
   User,
+  EmbedBuilder,
+  PermissionFlagsBits,
 } from "discord.js";
 import { scrapeChapter } from "./scraper.js";
 import {
@@ -63,6 +65,12 @@ import {
 } from "./voice.js";
 import type { GuildPrefs } from "./voice.js";
 import { MARKER_MODES } from "./markers.js";
+import {
+  enqueueOrPlay, skipLink, previousLink, removeItem, clearQueue, clearAll, buildQueuePayload, attachQueueTyping,
+  handleQueueInteraction, canControl, denyMessage, queueOwnerId, estimateSeconds, fmtClock, mdLink, pageCount,
+} from "./queue.js";
+import type { QueueItem } from "./queue.js";
+import { withTimeout } from "./util.js";
 import { EXPRESSION_LEVELS } from "./expressive.js";
 import type { ExpressionLevel } from "./expressive.js";
 import type { MarkerMode } from "./markers.js";
@@ -110,7 +118,10 @@ function helpText(): string {
     "`/stop` — stop reading and leave voice (saves your position)",
     "`/pause` — pause playback",
     "`/resume` — resume playback",
-    "`/skip` — skip to the next paragraph",
+    "`/queue [page]` — show the queue · `/read <url>` while something plays adds it to the queue",
+    "`/skip` — skip the current link and play the next · `/previous` — go back a link",
+    "`/skipparagraph` — skip to the next paragraph · `/remove <n>` · `/clear` — manage the queue",
+    "`/controls <restricted|open>` — who can skip/pause/seek (default: queue owner, the link's requester, Manage Server)",
     "`/find <text>` — search the chapter (typo-tolerant) and jump to it; use ⬅️ ➡️ to cycle matches",
     "`/speed [value]` — show/set reading speed (0.5×–3×); use the 🐢 🐇 buttons or ⚙️ Custom… on the player for your own step sizes",
     "`/rewind [amount]` · `/forward [amount]` — jump back/ahead, e.g. `30`, `1m`, `1m30s` (default: your skip step)",
@@ -211,14 +222,18 @@ async function logRead(user: User, guild: Guild, sourceChannel: TextChannel, url
       }
     } catch { /* non-fatal — bot may lack Create Instant Invite permission in this channel */ }
 
-    await (ch as TextChannel).send(
-      `📋 **Read request**\n` +
-      `👤 **User:** ${user.tag} (${user.id})\n` +
-      `🏠 **Server:** ${serverLink}\n` +
-      `🎙️ **Voice:** ${voiceLabel}\n` +
-      `🔗 **URL:** ${url}\n` +
-      `🕐 **Time:** ${ts}`
-    );
+    const embed = new EmbedBuilder()
+      .setColor(0x5865f2)
+      .setTitle("📋 Read request")
+      .setThumbnail(user.displayAvatarURL())
+      .addFields(
+        { name: "👤 User:",   value: `${user.tag} (${user.id})`, inline: true },
+        { name: "🏠 Server:", value: serverLink,                 inline: true },
+        { name: "🎙️ Voice:",  value: voiceLabel,                 inline: true },
+        { name: "🔗 URL:",    value: url.slice(0, 1000) },
+        { name: "🕐 Time:",   value: ts },
+      );
+    await (ch as TextChannel).send({ embeds: [embed] });
   } catch { /* non-fatal — log channel may be unreachable */ }
 }
 
@@ -230,12 +245,20 @@ async function handleRead(
   textChannel: TextChannel,
   memberVC: VoiceBasedChannel | null | undefined,
   explicitVC: VoiceBasedChannel | null | undefined,
-  url: string,
+  rawUrl: string,
   requestedBy: User,
   replyFn: (payload: { content: string; components?: ActionRowBuilder<StringSelectMenuBuilder>[] }) => Promise<Message | void>
 ): Promise<void> {
-  if (!url.startsWith("http")) { await replyFn({ content: "❌ Please provide a valid URL." }); return; }
-  await hydrateGuildVoice(guildId);
+  const t0  = Date.now();
+  const log = (stage: string) => console.log(`[read] guild=${guildId} user=${requestedBy.id} ${stage} (+${Date.now() - t0}ms)`);
+  const url = rawUrl.trim().replace(/^<|>$/g, "");                     // links pasted as <https://…> work too
+  if (!/^https?:\/\/\S+$/i.test(url)) { await replyFn({ content: "❌ Please provide a valid URL." }); return; }
+  log("start");
+
+  // Saved voice/settings — never allowed to hold up a read
+  try { await withTimeout(hydrateGuildVoice(guildId), 6_000, "Loading settings"); }
+  catch (err) { console.warn(`[read] settings skipped: ${(err as Error).message}`); }
+  log("settings ready");
 
   let voiceChannel: VoiceBasedChannel | null;
   if (explicitVC) {
@@ -251,46 +274,35 @@ async function handleRead(
 
   await replyFn({ content: "🔍 Fetching chapter..." });
 
+  const isFile = /\.(pdf|txt)(#.*)?$/i.test(url);
   let chapter;
-  try { chapter = await scrapeChapter(url); }
-  catch (err) { await safeSend(textChannel, `❌ Could not read that page: ${(err as Error).message}`); return; }
+  try { chapter = await withTimeout(scrapeChapter(url), isFile ? 180_000 : 45_000, "Fetching that link"); }
+  catch (err) { await replyFn({ content: `❌ Could not read that page: ${(err as Error).message}` }); return; }
+  log(`scraped ${chapter.paragraphs.length} paragraphs`);
 
   // Log the request to the admin channel (fire-and-forget)
   logRead(requestedBy, guild, textChannel, url, getGuildVoice(guildId).label).catch(() => {});
 
-  // ── Check for saved bookmark ─────────────────────────────────────────────
-  let resumeFromChunk = 0;
-  try {
-    const bookmark = await getBookmark(requestedBy.id, url);
-    if (bookmark && bookmark.chunkIndex > 0) {
-      resumeFromChunk = bookmark.chunkIndex;
-      const pct = Math.round((bookmark.chunkIndex / bookmark.totalChunks) * 100);
-      await safeSend(
-        textChannel,
-        `📌 Resuming **${bookmark.title}** from where you left off (${pct}% done). Use \`/restart\` to start from the beginning.`
-      );
-    }
-  } catch { /* non-fatal */ }
+  const item: QueueItem = {
+    url,
+    title:       chapter.title,
+    paragraphs:  chapter.paragraphs,
+    sections:    chapter.sections,
+    requestedBy: { id: requestedBy.id, tag: requestedBy.username },
+    seconds:     estimateSeconds(chapter.paragraphs, getPrefs(guildId).speed),
+  };
 
-  const voice = getGuildVoice(guildId);
-  await safeSend(
-    textChannel,
-    `📖 Starting **${chapter.title}** (${chapter.paragraphs.length} paragraphs)\n` +
-    `🎙️ Voice: **${voice.label}** — ${voice.accent} ${voice.gender} | Joining **${voiceChannel.name}**`
-  );
+  const result = await enqueueOrPlay({ guild, voiceChannel, textChannel, item });
+  log(`queue → ${result.status}`);
 
-  // Announce detected chapters/sections
-  if (chapter.sections.length > 1) {
-    await safeSend(
-      textChannel,
-      `📑 Detected **${chapter.sections.length} sections** — use \`/chapter <n>\` or the ⬅️ ➡️ buttons to navigate.`
-    );
-  }
-
-  try {
-    await startReading(guild, voiceChannel, textChannel, chapter.title, chapter.paragraphs, url, chapter.sections, resumeFromChunk, requestedBy.id);
-  } catch (err) {
-    await safeSend(textChannel, `❌ Voice error: ${(err as Error).message}`);
+  if (result.status === "queued") {
+    await replyFn({ content: `➕ Added to the queue (#${result.position}): ${mdLink(item)} · \`[${fmtClock(item.seconds)}]\`` });
+  } else if (result.status === "full") {
+    await replyFn({ content: "❌ The queue is full (50 links). Wait for some to play or use `/remove`." });
+  } else if (result.status === "error") {
+    await replyFn({ content: `❌ Voice error: ${result.message}` });
+  } else {
+    await replyFn({ content: `✅ Got it — ${mdLink(item)}` });
   }
 }
 
@@ -307,6 +319,7 @@ async function handleJoin(guild: Guild, memberVC: VoiceBasedChannel | null | und
 async function handleStop(guildId: string): Promise<string> {
   if (getSession(guildId)) {
     await stopSession(guildId);
+    clearAll(guildId);
     return "⏹️ Stopped and left the voice channel. Your position has been saved — read the same URL to resume.";
   }
   if (leaveStandby(guildId)) return "👋 Left the voice channel.";
@@ -321,8 +334,28 @@ function handleResume(guildId: string): string {
   return resumeSession(guildId) ? "▶️ Resuming..." : "❌ Nothing is paused.";
 }
 
-function handleSkip(guildId: string): string {
+function handleSkipParagraph(guildId: string): string {
   return skipParagraph(guildId) ? "⏭️ Skipping to the next paragraph..." : "❌ Nothing is currently playing.";
+}
+
+function handleSkip(guildId: string): Promise<string> {
+  return skipLink(guildId);
+}
+
+async function handleControls(guildId: string, member: GuildMember | null, mode: string | null): Promise<string> {
+  await hydrateGuildVoice(guildId);
+  const current = getPrefs(guildId).controls;
+  if (mode !== "open" && mode !== "restricted") {
+    return `🔐 Controls are **${current}**. ` + (current === "restricted"
+      ? "Only the queue owner, whoever queued the current link, and people with Manage Server can skip/pause/seek. `/controls open` lets everyone."
+      : "Anyone can skip/pause/seek. `/controls restricted` limits it again.");
+  }
+  const isManager = !!member && typeof member.permissions !== "string" && member.permissions.has(PermissionFlagsBits.ManageGuild);
+  if (!isManager && member?.id !== queueOwnerId(guildId)) return "🔒 Only someone with Manage Server (or the queue owner) can change this.";
+  setPrefs(guildId, { controls: mode });
+  return mode === "open"
+    ? "🔓 Controls are now **open** — anyone can skip, pause and seek."
+    : "🔐 Controls are now **restricted** — the queue owner, the requester of the current link and Manage Server members.";
 }
 
 function handleProgress(guildId: string): string {
@@ -633,6 +666,12 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
     return;
   }
 
+  // ── Queue screen (paging, "Make a selection", Play now / Play next / Remove) ──
+  if ((interaction.isButton() || interaction.isStringSelectMenu()) && interaction.customId.startsWith("q_")) {
+    await handleQueueInteraction(interaction, interaction.member as GuildMember | null);
+    return;
+  }
+
   // ── Voice picker (buttons + select menus whose ids start with "vp_") ───────────
   if ((interaction.isButton() || interaction.isStringSelectMenu()) && interaction.customId.startsWith("vp_")) {
     await handleVoiceInteraction(interaction);
@@ -645,6 +684,10 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
     const { customId } = btn;
 
     // /find prev / next match
+    if (customId === "find_go" && !canControl(guildId, interaction.member as GuildMember | null)) {
+      await btn.reply({ content: denyMessage(guildId), flags: MessageFlags.Ephemeral }).catch(() => {});
+      return;
+    }
     if (customId === "find_prev" || customId === "find_next" || customId === "find_go") {
       const reply = customId === "find_go"
         ? goFind(guildId)
@@ -660,6 +703,10 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
     // Seek/restart/pause/stop/chapter control buttons on the progress bar
     // ⚙️ Custom… opens a popup (must be answered with the popup, so no deferUpdate first)
     if (customId === "ctrl_speed_custom") {
+      if (!canControl(guildId, interaction.member as GuildMember | null)) {
+        await btn.reply({ content: denyMessage(guildId), flags: MessageFlags.Ephemeral }).catch(() => {});
+        return;
+      }
       const p = getPrefs(guildId);
       const field = (id: string, label: string, value: number) =>
         new ActionRowBuilder<TextInputBuilder>().addComponents(
@@ -680,6 +727,10 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
 
     const CTRL_IDS = ["ctrl_restart","ctrl_back","ctrl_forward","ctrl_pause","ctrl_stop","ctrl_prev_chapter","ctrl_next_chapter","ctrl_speed_down","ctrl_speed_up","ctrl_speed_label"];
     if (CTRL_IDS.includes(customId)) {
+      if (!canControl(guildId, interaction.member as GuildMember | null)) {
+        await btn.reply({ content: denyMessage(guildId), flags: MessageFlags.Ephemeral }).catch(() => {});
+        return;
+      }
       await btn.deferUpdate().catch(() => {});
       switch (customId) {
         case "ctrl_restart":      restartSession(guildId); break;
@@ -722,6 +773,13 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
   const editReply = (content: string) => cmd.editReply(content).catch(() => {});
 
   try {
+    const CONTROL_CMDS = new Set(["stop", "pause", "resume", "skip", "skipparagraph", "previous", "restart", "seek", "rewind", "forward", "chapter", "clear"]);
+    const changesSpeed = cmd.commandName === "speed" && (cmd.options.getNumber("value") !== null || cmd.options.getNumber("step") !== null);
+    if ((CONTROL_CMDS.has(cmd.commandName) || changesSpeed) && !canControl(guildId, member)) {
+      await editReply(denyMessage(guildId));
+      return;
+    }
+
     switch (cmd.commandName) {
       case "read": {
         const url        = cmd.options.getString("url", true);
@@ -745,7 +803,7 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
       case "stop":     await editReply(await handleStop(guildId)); break;
       case "pause":    await editReply(handlePause(guildId));      break;
       case "resume":   await editReply(handleResume(guildId));     break;
-      case "skip":     await editReply(handleSkip(guildId));       break;
+      case "skip":     await editReply(await handleSkip(guildId));       break;
       case "chapter": {
         const num = cmd.options.getInteger("number", true);
         await editReply(handleChapter(guildId, num));
@@ -758,6 +816,19 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
       case "rewind":   await editReply(handleMove(guildId, -1, cmd.options.getString("amount"))); break;
       case "forward":  await editReply(handleMove(guildId, +1, cmd.options.getString("amount"))); break;
       case "skipstep": await editReply(await handleSkipStep(guildId, cmd.options.getInteger("seconds", true))); break;
+      case "skipparagraph": await editReply(handleSkipParagraph(guildId)); break;
+      case "previous": await editReply(await previousLink(guildId)); break;
+      case "queue": {
+        const page = cmd.options.getInteger("page") ?? 1;
+        const msg  = await cmd.editReply(buildQueuePayload(guildId, page));
+        attachQueueTyping(msg, textChannel, interaction.user.id, guildId, Math.min(page, pageCount(guildId)));
+        break;
+      }
+      case "remove":
+        await editReply(await removeItem(guildId, cmd.options.getInteger("position", true), interaction.user.id, canControl(guildId, member)));
+        break;
+      case "clear":    await editReply(clearQueue(guildId)); break;
+      case "controls": await editReply(await handleControls(guildId, member, cmd.options.getString("mode"))); break;
       case "expression":
         await editReply(await handleExpression(guildId, cmd.options.getString("level")));
         break;
@@ -831,7 +902,7 @@ client.on(Events.MessageCreate, async (message: Message) => {
         case "stop":     reply = await handleStop(guildId); break;
         case "pause":    reply = handlePause(guildId);      break;
         case "resume":   reply = handleResume(guildId);     break;
-        case "skip":     reply = handleSkip(guildId);       break;
+        case "skip":     reply = await handleSkip(guildId);       break;
         case "restart":  reply = handleRestart(guildId);    break;
         case "find":     reply = handleFind(guildId, args.join(" "), false).content; break;
         case "chapter": {
@@ -864,12 +935,18 @@ client.on(Events.MessageCreate, async (message: Message) => {
   const member   = message.member as GuildMember | null;
   const memberVC = member?.voice?.channel ?? null;
 
+  const PREFIX_CONTROL = new Set(["stop", "pause", "resume", "skip", "sp", "skipparagraph", "previous", "prev", "restart", "seek", "rewind", "rw", "forward", "ff", "fastforward", "chapter", "clear"]);
+  if (PREFIX_CONTROL.has(command) && !canControl(guildId, member)) {
+    try { await message.reply(denyMessage(guildId)); } catch { /* ignore */ }
+    return;
+  }
+
   try {
     switch (command) {
       case "read": {
         let placeholder: Message | undefined;
         try { placeholder = await message.reply("🔍 Working..."); } catch { placeholder = undefined; }
-        await handleRead(guildId, message.guild!, textChannel, memberVC, null, args[0] ?? "", message.author,
+        await handleRead(guildId, message.guild!, textChannel, memberVC, null, args.find((a) => /^<?https?:/i.test(a)) ?? args[0] ?? "", message.author,
           async (p) => {
             try {
               if (placeholder) return await placeholder.edit({ content: p.content, components: p.components ?? [] });
@@ -900,10 +977,27 @@ client.on(Events.MessageCreate, async (message: Message) => {
         return;
       }
 
+      case "skipparagraph": case "sp": reply = handleSkipParagraph(guildId); break;
+      case "previous": case "prev":    reply = await previousLink(guildId); break;
+      case "queue": case "q": {
+        const page = parseInt(args[0] ?? "1", 10) || 1;
+        try {
+          const msg = await message.reply(buildQueuePayload(guildId, page));
+          attachQueueTyping(msg, textChannel, message.author.id, guildId, Math.min(page, pageCount(guildId)));
+        } catch (err) { console.error("[prefix queue]", err); }
+        return;
+      }
+      case "remove": case "rm": {
+        const n = parseInt(args[0] ?? "", 10);
+        reply = Number.isFinite(n) && n >= 1 ? await removeItem(guildId, n, message.author.id, canControl(guildId, member)) : "❌ Usage: `!remove <position>`";
+        break;
+      }
+      case "clear":    reply = clearQueue(guildId); break;
+      case "controls": reply = await handleControls(guildId, member, args[0]?.toLowerCase() ?? null); break;
       case "stop":     reply = await handleStop(guildId); break;
       case "pause":    reply = handlePause(guildId);      break;
       case "resume":   reply = handleResume(guildId);     break;
-      case "skip":     reply = handleSkip(guildId);       break;
+      case "skip":     reply = await handleSkip(guildId);       break;
       case "chapter": {
         const num = parseInt(args[0] ?? "", 10);
         reply = isNaN(num) || num < 1 ? "❌ Usage: `!chapter <number>`" : handleChapter(guildId, num);

@@ -12,7 +12,27 @@ export const slashCommands = [
   new SlashCommandBuilder().setName("stop").setDescription("Stop reading and leave voice (saves your position)"),
   new SlashCommandBuilder().setName("pause").setDescription("Pause playback"),
   new SlashCommandBuilder().setName("resume").setDescription("Resume playback"),
-  new SlashCommandBuilder().setName("skip").setDescription("Skip to the next paragraph"),
+  new SlashCommandBuilder().setName("skip").setDescription("Skip the current link and play the next one in the queue"),
+  new SlashCommandBuilder().setName("skipparagraph").setDescription("Skip to the next paragraph of the current link"),
+  new SlashCommandBuilder().setName("previous").setDescription("Go back to the previous link"),
+  new SlashCommandBuilder()
+    .setName("queue")
+    .setDescription("Show the queue of links")
+    .addIntegerOption((o) => o.setName("page").setDescription("Page to open").setMinValue(1)),
+  new SlashCommandBuilder()
+    .setName("remove")
+    .setDescription("Remove a link from the queue")
+    .addIntegerOption((o) => o.setName("position").setDescription("Its number in /queue").setMinValue(1).setRequired(true)),
+  new SlashCommandBuilder().setName("clear").setDescription("Clear the whole queue (keeps the current link playing)"),
+  new SlashCommandBuilder()
+    .setName("controls")
+    .setDescription("Who can skip/pause/seek: the queue owner and requester, or everyone")
+    .addStringOption((o) =>
+      o.setName("mode").setDescription("Control mode")
+        .addChoices(
+          { name: "Restricted (owner, requester, Manage Server)", value: "restricted" },
+          { name: "Open (everyone)",                              value: "open" },
+        )),
   new SlashCommandBuilder()
     .setName("find")
     .setDescription("Search the chapter (typo-tolerant) and jump to the match")

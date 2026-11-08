@@ -76,6 +76,19 @@ interface ExtractResult {
   sections: ChapterSection[];
 }
 
+/** True for real pictures; false for emoji, icons, avatars, buttons and 1px trackers. */
+function isContentImage($: cheerio.CheerioAPI, el: any): boolean {
+  const img = $(el);
+  const src = `${img.attr("src") ?? ""} ${img.attr("data-src") ?? ""} ${img.attr("data-lazy-src") ?? ""}`.toLowerCase();
+  if (!src.trim()) return false;
+  if (/emoji|smilies|gravatar|avatar|spacer|pixel|tracking|stat\.|logo|icon|sprite|badge|button|banner-ad/.test(src)) return false;
+  if (/(^|\s)(wp-smiley|emoji|avatar|icon)(\s|$)/i.test(img.attr("class") ?? "")) return false;
+  const w = parseInt(img.attr("width") ?? "", 10);
+  const h = parseInt(img.attr("height") ?? "", 10);
+  if ((Number.isFinite(w) && w > 0 && w < 60) || (Number.isFinite(h) && h > 0 && h < 60)) return false;
+  return true;
+}
+
 /** Text of a bullet/numbered item (its own text only — nested lists and <p> children are read separately). */
 function listItemText($: cheerio.CheerioAPI, el: any): string {
   const item = $(el);
@@ -99,9 +112,15 @@ function extractParagraphs(
   const sections: ChapterSection[] = [];
   let partCounter = 0;
 
-  contentEl.find("p, li, h1, h2, h3, h4, h5, h6, hr").each((_, el) => {
+  contentEl.find("p, li, h1, h2, h3, h4, h5, h6, hr, img").each((_, el) => {
     const tag = (el as any).tagName?.toLowerCase() ?? "";
     if (SKIP_TAGS.has(tag)) return;
+
+    // Pictures: say so (no sound or marker) — but not emoji, avatars, icons or tracking pixels
+    if (tag === "img") {
+      if (isContentImage($, el)) paragraphs.push("Image file.");
+      return;
+    }
 
     // Horizontal rule — only treat as scene break on non-AO3 sites
     if (tag === "hr") {

@@ -7,6 +7,7 @@ import type { VoiceOption } from "./voices.js";
 import { DEFAULT_VOICE } from "./voices.js";
 import { elevenSynthesize, ElevenError } from "./eleven.js";
 import { expressiveBody } from "./expressive.js";
+import { splitLanguages, japaneseVoiceId } from "./lang.js";
 import type { ExpressionLevel } from "./expressive.js";
 import { splitWithSfx, softenShouting, getSfxFile, FALLBACK_SPEECH, SFX_ENABLED } from "./sfx.js";
 import type { Segment } from "./sfx.js";
@@ -153,6 +154,29 @@ async function edgeToFile(raw: string, voice: VoiceOption, level: ExpressionLeve
   throw lastErr;
 }
 
+/** Speak text that may mix English and Japanese: each language goes to a voice that can read it. */
+async function edgeSpeak(raw: string, voice: VoiceOption, level: ExpressionLevel = "off"): Promise<string> {
+  const segments = splitLanguages(raw);
+  if (segments.length <= 1 && !segments[0]?.ja) return edgeToFile(raw, voice, level);
+
+  const jaVoice: VoiceOption = { ...voice, id: japaneseVoiceId(voice.gender), service: "edge" };
+  const files: string[] = [];
+  try {
+    for (const seg of segments) {
+      if (!/[\p{L}\p{N}]/u.test(seg.text)) continue;
+      files.push(await edgeToFile(seg.text, seg.ja ? jaVoice : voice, seg.ja ? "off" : level));
+    }
+    if (files.length === 0) return await silenceFile(0.15);
+    if (files.length === 1) { const only = files[0]!; files.length = 0; return only; }
+    return await concatAudio(files.map((file) => ({ file })));
+  } catch (err) {
+    console.warn(`[tts] mixed-language read failed (${(err as Error).message}) — reading it with the normal voice`);
+    return await edgeToFile(raw, voice, level);
+  } finally {
+    await Promise.all(files.map((f) => cleanupFile(f)));
+  }
+}
+
 /** Speak the text parts, drop in sound clips for the reactions, and stitch it all into one mp3. */
 async function edgeWithSfx(segments: Segment[], plainText: string, voice: VoiceOption, level: ExpressionLevel = "off"): Promise<string> {
   const parts: AudioPart[] = [];
@@ -161,7 +185,7 @@ async function edgeWithSfx(segments: Segment[], plainText: string, voice: VoiceO
     for (const seg of segments) {
       if (seg.type === "text") {
         if (!/[\p{L}\p{N}]/u.test(seg.text)) continue;
-        const f = await edgeToFile(seg.text, voice, level);
+        const f = await edgeSpeak(seg.text, voice, level);
         temps.push(f); parts.push({ file: f });
         continue;
       }
@@ -186,7 +210,7 @@ async function edgeWithSfx(segments: Segment[], plainText: string, voice: VoiceO
       return await concatAudio(parts);
     } catch (err) {
       console.warn(`[tts] couldn't mix sound effects (${(err as Error).message}) — reading the text instead`);
-      return await edgeToFile(plainText, voice, level);
+      return await edgeSpeak(plainText, voice, level);
     }
   } finally {
     await Promise.all(temps.map((f) => cleanupFile(f)));
@@ -238,7 +262,7 @@ export async function textToMp3File(
     // ── Bing / Edge voices (with reactions: screams, screeches, scratches…) ──
     const segments: Segment[] = SFX_ENABLED ? splitWithSfx(clean) : [{ type: "text", text: clean }];
     if (segments.length === 1 && segments[0]!.type === "text") {
-      return await edgeToFile(clean, voice, level);
+      return await edgeSpeak(clean, voice, level);
     }
     return await edgeWithSfx(segments, clean, voice, level);
   } finally {
@@ -251,7 +275,7 @@ export async function cleanupFile(filePath: string): Promise<void> {
 }
 
 export function splitIntoChunks(text: string, maxChars = 400): string[] {
-  const sentences = text.match(/[^.!?]+[.!?]+["'\u201C\u201D]?|[^.!?]+$/g) ?? [text];
+  const sentences = text.match(/[^.!?。！？]+[.!?。！？]+["'\u201C\u201D」』]?|[^.!?。！？]+$/g) ?? [text];
   const chunks: string[] = [];
   let current = "";
   for (const sentence of sentences) {

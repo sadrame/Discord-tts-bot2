@@ -16,8 +16,19 @@ console.log(
     : "[storage] using a local file — saved positions/voices are LOST on every Render restart. Set UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN to fix this."
 );
 
+// A slow or unreachable database must NEVER stall a command: every request has a short timeout, and after
+// a failure Redis is skipped for a minute (reads count as "not found", writes are dropped with a warning).
+const KV_TIMEOUT_MS = 4_000;
+let downUntil = 0;
+function markDown(err: unknown): void {
+  const first = Date.now() >= downUntil;
+  downUntil = Date.now() + 60_000;
+  if (first) console.warn(`[storage] Redis didn't answer (${(err as Error).message}) — skipping it for 60s`);
+}
+
 async function redis(command: (string | number)[]): Promise<unknown> {
   const res = await fetch(REDIS_URL!, {
+    signal:  AbortSignal.timeout(KV_TIMEOUT_MS),
     method:  "POST",
     headers: { Authorization: `Bearer ${REDIS_TOKEN}`, "Content-Type": "application/json" },
     body:    JSON.stringify(command),
@@ -41,15 +52,20 @@ async function saveFile(store: FileStore): Promise<void> {
 
 export async function kvGet(key: string): Promise<string | null> {
   if (USE_REDIS) {
-    const raw = await redis(["GET", key]);
-    return typeof raw === "string" ? raw : null;
+    if (Date.now() < downUntil) return null;
+    try {
+      const raw = await redis(["GET", key]);
+      return typeof raw === "string" ? raw : null;
+    } catch (err) { markDown(err); return null; }
   }
   return (await loadFile())[key] ?? null;
 }
 
 export async function kvSet(key: string, value: string, ttlSeconds?: number): Promise<void> {
   if (USE_REDIS) {
-    await redis(ttlSeconds ? ["SET", key, value, "EX", ttlSeconds] : ["SET", key, value]);
+    if (Date.now() < downUntil) return;
+    try { await redis(ttlSeconds ? ["SET", key, value, "EX", ttlSeconds] : ["SET", key, value]); }
+    catch (err) { markDown(err); }
     return;
   }
   const store = await loadFile();
@@ -58,7 +74,11 @@ export async function kvSet(key: string, value: string, ttlSeconds?: number): Pr
 }
 
 export async function kvDel(key: string): Promise<void> {
-  if (USE_REDIS) { await redis(["DEL", key]); return; }
+  if (USE_REDIS) {
+    if (Date.now() < downUntil) return;
+    try { await redis(["DEL", key]); } catch (err) { markDown(err); }
+    return;
+  }
   const store = await loadFile();
   if (key in store) { delete store[key]; await saveFile(store); }
 }
