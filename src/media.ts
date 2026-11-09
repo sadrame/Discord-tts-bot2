@@ -2,18 +2,26 @@ import { spawn } from "child_process";
 import { unlink } from "fs/promises";
 import { randomUUID } from "crypto";
 import { tmpdir } from "os";
-import { join } from "path";
+import { delimiter, dirname, join } from "path";
 
 // Small ffmpeg helpers: stitch speech + sound effects together, and change playback speed.
 
 async function resolveFfmpeg(): Promise<string> {
   if (process.env["FFMPEG_PATH"]) return process.env["FFMPEG_PATH"];
-  try {
-    const mod = (await import("ffmpeg-static")) as unknown as { default?: unknown };
-    const p = mod.default ?? mod;
-    if (typeof p === "string" && p) return p;
-  } catch { /* fall through to system ffmpeg */ }
-  return "ffmpeg";
+  // The binary ships inside the npm package (nothing is downloaded at install time, so builds can't fail on a flaky download)
+  for (const name of ["@ffmpeg-installer/ffmpeg", "ffmpeg-static"]) {
+    try {
+      const mod = (await import(name)) as { default?: unknown; path?: unknown };
+      const found = (mod.default as { path?: unknown } | string | undefined) ?? mod;
+      const p = typeof found === "string" ? found : (found as { path?: unknown }).path;
+      if (typeof p === "string" && p) {
+        // put it on PATH too, so the voice library's own fallback transcoding finds it
+        process.env["PATH"] = `${dirname(p)}${delimiter}${process.env["PATH"] ?? ""}`;
+        return p;
+      }
+    } catch { /* not installed — try the next one */ }
+  }
+  return "ffmpeg";                                  // system ffmpeg
 }
 const ffmpegBin: Promise<string> = resolveFfmpeg();
 
