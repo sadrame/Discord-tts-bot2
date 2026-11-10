@@ -17,6 +17,9 @@ Every voice shows the plan it needs (🆓 Free, 💳 Starter+/Creator+/Paid), an
 ## Speed, rewind and fast-forward
 The player has 🐢 Slower / 🐇 Faster buttons, and **⚙️ Custom…** opens a popup to set the exact speed, the speed-button step and the skip step. `/speed 1.25` sets it directly (0.5×–3×). `/rewind` and `/forward` move by your skip step, or by an amount: `/forward 30`, `/rewind 1m30s`. `/skipstep 15` changes the default. Speed changes apply from the next sentence and are remembered per server.
 
+## If the bot is offline
+Open `https://<your-service>.onrender.com/status` in a browser — it says whether Discord is connected and, if not, exactly why (token rejected/reset, Message Content Intent off, Discord blocking the IP, no token set…). The bot never exits on a failed login (restart loops make Discord block or reset the token); it retries by itself with growing waits, except for a rejected token, which needs a new one in Render → Environment. Slash commands are only re-sent to Discord when they change, and the bot pings its own URL every 4 minutes so Render's free plan doesn't put it to sleep (`KEEPALIVE_URL` to override).
+
 ## Queue
 `/read <url>` plays right away if nothing is playing, otherwise adds the link to the queue; links then play one after another without the bot leaving the channel. `/queue` shows it Jockie-style (page, `[mm:ss]`, linked titles, a "Make a selection" menu to play now / play next / remove, and you can also type `next page`, `previous page`, `go to page 3` or `cancel`). `/skip` skips the current link, `/previous` goes back, `/remove <n>`, `/clear`, and `/skipparagraph` skips just the paragraph. `/stop` clears everything.
 
