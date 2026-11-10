@@ -61,6 +61,7 @@ export interface ReadSession {
   chunkIndex:       number;         // next chunk to GENERATE
   playingIdx:       number;         // chunk currently playing (what the user hears)
   lastFinished:     number;         // last chunk that played to the end (−1 before the first)
+  ratio:            number;         // real playing time ÷ estimated time (so "10 seconds" means 10 REAL seconds)
   seekEpoch:        number;         // bumped on every seek so stale audio is discarded
   speed:            number;         // playback speed multiplier (0.5 – 3.0)
   paused:           boolean;
@@ -419,6 +420,7 @@ export async function startReading(
     chunkIndex:       startChunk,
     playingIdx:       startChunk,
     lastFinished:     startChunk - 1,
+    ratio:            1,
     seekEpoch:        0,
     speed,
     paused:           false,
@@ -835,6 +837,7 @@ async function runPipeline(session: ReadSession): Promise<void> {
       if (!current) { await sleep(50); continue; }                                 // still generating
 
       session.playingIdx = current.chunkIdx;
+      rebaseClock(session, current.chunkIdx);          // re-anchor the clock at every clip so estimates can't drift
 
       // Normally the clip was already encoded for playback. If the speed changed since, redo just this one.
       const cleanup: string[] = [current.file];
@@ -857,8 +860,16 @@ async function runPipeline(session: ReadSession): Promise<void> {
       try {
         session.player.play(createAudioResource(playFile, { inputType }));
         await entersState(session.player, AudioPlayerStatus.Playing, 10_000);
+        const playStart = Date.now();
         await waitForIdle(session);
-        if (current.epoch === session.seekEpoch) session.lastFinished = current.chunkIdx;
+        if (current.epoch === session.seekEpoch) {
+          session.lastFinished = current.chunkIdx;
+          // Learn how long the voice really takes compared with the estimate
+          const pausedMs = session.pausedDuration + (session.pauseStartedAt !== null ? Date.now() - session.pauseStartedAt : 0);
+          const real = (Date.now() - playStart - pausedMs) / 1000;
+          const est  = chunkSeconds(session.allChunks[current.chunkIdx] ?? "", session.speed);
+          if (real > 0.3 && est > 0.3) session.ratio = Math.min(3, Math.max(0.4, session.ratio * 0.8 + (real / est) * 0.2));
+        }
       } catch { /* player stopped — ok */ } finally {
         await Promise.all(cleanup.map((f) => cleanupFile(f)));
       }
@@ -1027,7 +1038,7 @@ export function seekSessionBySeconds(guildId: string, targetSec: number): boolea
 export function seekRelativeSeconds(guildId: string, deltaSec: number): boolean {
   const session = sessions.get(guildId);
   if (!session) return false;
-  return seekSessionBySeconds(guildId, getElapsedSeconds(session) + deltaSec);
+  return seekSessionBySeconds(guildId, getElapsedSeconds(session) + deltaSec / session.ratio);
 }
 
 /** Move playback by a number of seconds (negative = rewind). Returns the new position. */

@@ -1,4 +1,6 @@
 import { createServer } from "http";
+import { createHash } from "crypto";
+import { kvGet, kvSet } from "./kv.js";
 import {
   Client,
   Events,
@@ -636,9 +638,17 @@ client.once(Events.ClientReady, async (c) => {
   console.log(`🎙️ Voices loaded: ${VOICES.map(v => v.label).join(", ")}`);
   c.user.setActivity("📖 /help or !help");
   try {
-    const rest = new REST().setToken(process.env["DISCORD_BOT_TOKEN"]!);
-    await rest.put(Routes.applicationCommands(c.user.id), { body: slashCommands });
-    console.log("✅ Slash commands registered globally.");
+    // Only talk to Discord's command API when the commands actually changed (every restart used to re-send them)
+    const hash  = createHash("sha1").update(c.user.id + JSON.stringify(slashCommands)).digest("hex");
+    const saved = await kvGet("wct:cmdhash").catch(() => null);
+    if (saved === hash) {
+      console.log("✅ Slash commands unchanged — skipping registration.");
+    } else {
+      const rest = new REST().setToken(process.env["DISCORD_BOT_TOKEN"]!);
+      await rest.put(Routes.applicationCommands(c.user.id), { body: slashCommands });
+      await kvSet("wct:cmdhash", hash).catch(() => {});
+      console.log("✅ Slash commands registered globally.");
+    }
   } catch (err) {
     console.error("Failed to register slash commands:", err);
   }
@@ -1034,19 +1044,98 @@ client.on(Events.MessageCreate, async (message: Message) => {
   try { await message.reply(reply); } catch (err) { console.error("[prefix reply]", err); }
 });
 
-// ─── Tiny health server for Render / UptimeRobot ─────────────────────────────
-// Render requires a web service to bind a port. This keeps UptimeRobot happy
-// without needing a separate API server process.
+// ─── Status page: see WHY the bot is down without digging through logs ───────
+// Open  https://<your-service>.onrender.com/status  in a browser.
+
+const botState = {
+  startedAt:     Date.now(),
+  ready:         false,
+  tag:           null as string | null,
+  loginAttempts: 0,
+  lastError:     null as string | null,
+  lastEvent:     "starting",
+};
+const memoryMB = (): number => Math.round(process.memoryUsage().rss / 1048576);
 
 const PORT = process.env["PORT"] ? parseInt(process.env["PORT"], 10) : 3000;
-createServer((_req, res) => {
-  res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("OK");
+createServer((req, res) => {
+  if (req.url?.startsWith("/status")) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      discordConnected: botState.ready,
+      botTag:           botState.tag,
+      problem:          botState.ready ? null : botState.lastError,
+      lastEvent:        botState.lastEvent,
+      loginAttempts:    botState.loginAttempts,
+      uptimeMinutes:    Math.round((Date.now() - botState.startedAt) / 60000),
+      memoryMB:         memoryMB(),
+      tokenSet:         Boolean(process.env["DISCORD_BOT_TOKEN"]),
+    }, null, 2));
+    return;
+  }
+  res.writeHead(200, { "Content-Type": "text/plain" });          // always 200 so Render keeps the service alive
+  res.end(botState.ready ? `OK — connected as ${botState.tag}` : `Server is up, but Discord is NOT connected: ${botState.lastError ?? "connecting…"}`);
 }).listen(PORT, () => console.log(`✅ Health server listening on port ${PORT}`));
 
-// ─── Start ────────────────────────────────────────────────────────────────────
+function diagnose(message: string): string {
+  if (/TokenInvalid|invalid token|An invalid token/i.test(message))
+    return "Discord rejected DISCORD_BOT_TOKEN (it's wrong, or Discord reset it). Developer Portal → your app → Bot → Reset Token, then paste the new token into Render → Environment → DISCORD_BOT_TOKEN and redeploy.";
+  if (/disallowed intents|DisallowedIntents/i.test(message))
+    return "A required intent is off. Developer Portal → your app → Bot → turn ON \"Message Content Intent\", save, then redeploy.";
+  if (/429|1015|cloudflare|rate.?limit|banned|blocked/i.test(message))
+    return "Discord/Cloudflare is temporarily blocking this server's IP (too many requests, usually from repeated restarts). Don't redeploy repeatedly — wait 30–60 minutes; the bot keeps retrying by itself.";
+  if (/ENOTFOUND|ETIMEDOUT|ECONNRESET|EAI_AGAIN|fetch failed|network/i.test(message))
+    return `Network problem reaching Discord (${message}). The bot keeps retrying by itself.`;
+  return message;
+}
 
-const token = process.env["DISCORD_BOT_TOKEN"];
-if (!token) { console.error("DISCORD_BOT_TOKEN is not set."); process.exit(1); }
+client.on(Events.ClientReady, (c) => { botState.ready = true; botState.tag = c.user.tag; botState.lastError = null; botState.lastEvent = "connected"; });
+client.on(Events.ShardDisconnect, (ev) => { botState.ready = false; botState.lastEvent = `gateway disconnected (code ${ev.code})`; console.warn(`[gateway] ${botState.lastEvent}`); });
+client.on(Events.ShardReconnecting, () => { botState.lastEvent = "gateway reconnecting"; console.warn("[gateway] reconnecting…"); });
+client.on(Events.ShardResume, () => { botState.ready = true; botState.lastEvent = "gateway resumed"; console.log("[gateway] resumed"); });
+client.on(Events.ShardError, (err) => { botState.lastEvent = `gateway error: ${err.message}`; console.error("[gateway] error:", err.message); });
+client.on(Events.Invalidated, () => { botState.ready = false; botState.lastError = "Discord invalidated the session"; console.error("[gateway] session invalidated"); });
+client.on(Events.Error, (err) => console.error("[client] error:", err.message));
+client.rest.on("rateLimited", (info) => console.warn(`[rate-limit] ${info.method} ${info.route} — retry in ${Math.round(info.retryAfter / 1000)}s`));
 
-client.login(token).catch((err) => { console.error("Failed to log in:", err); process.exit(1); });
+// ─── Start (never exits: a crash loop makes Discord block or reset the bot) ───
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+async function connectDiscord(): Promise<void> {
+  const token = process.env["DISCORD_BOT_TOKEN"];
+  if (!token) {
+    botState.lastError = "DISCORD_BOT_TOKEN is not set. Render → Environment → add it, then redeploy.";
+    console.error(`[login] ${botState.lastError}`);
+    return;
+  }
+  let delay = 20_000;
+  for (;;) {
+    botState.loginAttempts++;
+    botState.lastEvent = `logging in (attempt ${botState.loginAttempts})`;
+    console.log(`[login] attempt ${botState.loginAttempts} (token length ${token.length})`);
+    try {
+      await client.login(token);
+      return;
+    } catch (err) {
+      const message = (err as Error).message ?? String(err);
+      botState.lastError = diagnose(message);
+      console.error(`[login] failed: ${botState.lastError}`);
+      if (/TokenInvalid|invalid token|disallowed intents|DisallowedIntents/i.test(message)) {
+        console.error("[login] Retrying won't help — fix the setting above and redeploy. The status page stays up.");
+        return;                                                    // retrying would only add to Discord's login limit
+      }
+      await sleep(delay);
+      delay = Math.min(delay * 2, 10 * 60_000);                    // 20s → 40s → … → 10 min
+    }
+  }
+}
+connectDiscord().catch((err) => console.error("[login] unexpected:", err));
+
+// Free Render services go to sleep after ~15 min without web traffic: ping ourselves so the bot stays online
+const selfUrl = process.env["KEEPALIVE_URL"] ?? process.env["RENDER_EXTERNAL_URL"];
+if (selfUrl) {
+  setInterval(() => { fetch(selfUrl, { signal: AbortSignal.timeout(10_000) }).catch(() => {}); }, 4 * 60_000);
+  console.log(`[keepalive] pinging ${selfUrl} every 4 minutes`);
+}
+setInterval(() => { if (memoryMB() > 420) console.warn(`[memory] ${memoryMB()} MB in use — the free plan limit is 512 MB`); }, 60_000);
