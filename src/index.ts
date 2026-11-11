@@ -629,6 +629,7 @@ const client = new Client({
     GatewayIntentBits.DirectMessages,
   ],
   partials: [Partials.Channel], // required to receive DM events
+  rest: { rejectOnRateLimit: ["/gateway/bot"] },   // report a rate limit/block instead of silently waiting hours
 });
 
 // ─── Ready ────────────────────────────────────────────────────────────────────
@@ -1054,7 +1055,16 @@ const botState = {
   loginAttempts: 0,
   lastError:     null as string | null,
   lastEvent:     "starting",
+  discordCheck:  "not checked yet",
 };
+const DISCORD_API = (process.env["DISCORD_API_BASE"] ?? "https://discord.com/api/v10").replace(/\/$/, "");
+const debugLines: string[] = [];                      // the last few lines of the gateway connection log (token removed)
+client.on(Events.Debug, (msg) => {
+  const secret = process.env["DISCORD_BOT_TOKEN"];
+  const clean  = secret ? msg.split(secret).join("[token]") : msg;
+  debugLines.push(`${new Date().toISOString().slice(11, 19)} ${clean}`.slice(0, 220));
+  if (debugLines.length > 25) debugLines.shift();
+});
 const memoryMB = (): number => Math.round(process.memoryUsage().rss / 1048576);
 
 const PORT = process.env["PORT"] ? parseInt(process.env["PORT"], 10) : 3000;
@@ -1066,6 +1076,8 @@ createServer((req, res) => {
       botTag:           botState.tag,
       problem:          botState.ready ? null : botState.lastError,
       lastEvent:        botState.lastEvent,
+      discordCheck:     botState.discordCheck,
+      recentDebug:      debugLines.slice(-12),
       loginAttempts:    botState.loginAttempts,
       uptimeMinutes:    Math.round((Date.now() - botState.startedAt) / 60000),
       memoryMB:         memoryMB(),
@@ -1074,10 +1086,35 @@ createServer((req, res) => {
     return;
   }
   res.writeHead(200, { "Content-Type": "text/plain" });          // always 200 so Render keeps the service alive
-  res.end(botState.ready ? `OK — connected as ${botState.tag}` : `Server is up, but Discord is NOT connected: ${botState.lastError ?? "connecting…"}`);
+  res.end(botState.ready ? `OK — connected as ${botState.tag}` : `Server is up, but Discord is NOT connected: ${botState.lastError ?? "connecting…"}\nDiscord check: ${botState.discordCheck}\n(see /status for details)`);
 }).listen(PORT, () => console.log(`✅ Health server listening on port ${PORT}`));
 
+/** Ask Discord's API directly (with a timeout) and say in plain words what it answered. */
+async function preflight(token: string): Promise<string> {
+  try {
+    const res  = await fetch(`${DISCORD_API}/gateway/bot`, {
+      headers: { Authorization: `Bot ${token}`, "User-Agent": "DiscordBot (https://github.com/sadrame/Discord-tts-bot2, 1.0)" },
+      signal:  AbortSignal.timeout(15_000),
+    });
+    const body = await res.text();
+    if (res.status === 200) {
+      const l = (JSON.parse(body) as { session_start_limit?: { total: number; remaining: number; reset_after: number } }).session_start_limit;
+      return l
+        ? `OK — Discord accepts the token. Logins left in this window: ${l.remaining}/${l.total} (resets in ${Math.round(l.reset_after / 60000)} min)`
+        : "OK — Discord accepts the token.";
+    }
+    if (res.status === 401) return "TOKEN REJECTED (HTTP 401) — the token is wrong or was reset.";
+    if (res.status === 429 || /cloudflare|1015|you are being blocked/i.test(body))
+      return `BLOCKED (HTTP ${res.status}) — Discord/Cloudflare is rate-limiting or blocking this server's IP. Retry-After: ${res.headers.get("retry-after") ?? "?"}s. ${body.replace(/\s+/g, " ").slice(0, 140)}`;
+    return `Unexpected answer (HTTP ${res.status}): ${body.replace(/\s+/g, " ").slice(0, 160)}`;
+  } catch (err) {
+    return `Can't reach Discord from this server: ${(err as Error).message}`;
+  }
+}
+
 function diagnose(message: string): string {
+  if (/timed out/i.test(message))
+    return "Discord didn't finish the login in time. Look at discordCheck and recentDebug on /status — they show where it stalls.";
   if (/TokenInvalid|invalid token|An invalid token/i.test(message))
     return "Discord rejected DISCORD_BOT_TOKEN (it's wrong, or Discord reset it). Developer Portal → your app → Bot → Reset Token, then paste the new token into Render → Environment → DISCORD_BOT_TOKEN and redeploy.";
   if (/disallowed intents|DisallowedIntents/i.test(message))
@@ -1112,10 +1149,19 @@ async function connectDiscord(): Promise<void> {
   let delay = 20_000;
   for (;;) {
     botState.loginAttempts++;
+    botState.lastEvent = `asking Discord if the token is OK (attempt ${botState.loginAttempts})`;
+    botState.discordCheck = await preflight(token);
+    console.log(`[login] pre-check: ${botState.discordCheck}`);
+    if (botState.discordCheck.startsWith("TOKEN REJECTED")) {
+      botState.lastError = diagnose("invalid token");
+      console.error(`[login] ${botState.lastError}`);
+      return;                                                      // a new token is needed — retrying only adds to Discord's limit
+    }
+
     botState.lastEvent = `logging in (attempt ${botState.loginAttempts})`;
     console.log(`[login] attempt ${botState.loginAttempts} (token length ${token.length})`);
     try {
-      await client.login(token);
+      await withTimeout(client.login(token), 120_000, "Discord login");     // never hang forever
       return;
     } catch (err) {
       const message = (err as Error).message ?? String(err);
@@ -1123,10 +1169,15 @@ async function connectDiscord(): Promise<void> {
       console.error(`[login] failed: ${botState.lastError}`);
       if (/TokenInvalid|invalid token|disallowed intents|DisallowedIntents/i.test(message)) {
         console.error("[login] Retrying won't help — fix the setting above and redeploy. The status page stays up.");
-        return;                                                    // retrying would only add to Discord's login limit
+        return;
       }
-      await sleep(delay);
-      delay = Math.min(delay * 2, 10 * 60_000);                    // 20s → 40s → … → 10 min
+      try { void client.destroy(); } catch { /* not connected yet */ }
+      let wait = delay;
+      const reset = (err as { timeToReset?: number }).timeToReset;           // Discord told us when to come back
+      if (typeof reset === "number") wait = Math.min(Math.max(reset + 5_000, delay), 30 * 60_000);
+      console.log(`[login] trying again in ${Math.round(wait / 1000)}s`);
+      await sleep(wait);
+      delay = Math.min(delay * 2, 10 * 60_000);
     }
   }
 }
