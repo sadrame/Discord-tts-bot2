@@ -20,6 +20,11 @@ The player has 🐢 Slower / 🐇 Faster buttons, and **⚙️ Custom…** opens
 ## If the bot is offline
 Open `https://<your-service>.onrender.com/status` in a browser — it says whether Discord is connected and, if not, exactly why (token rejected/reset, Message Content Intent off, Discord blocking the IP, no token set…). The bot never exits on a failed login (restart loops make Discord block or reset the token); it retries by itself with growing waits, except for a rejected token, which needs a new one in Render → Environment. Slash commands are only re-sent to Discord when they change, and the bot pings its own URL every 4 minutes so Render's free plan doesn't put it to sleep (`KEEPALIVE_URL` to override).
 
+## History
+`/history [scope] [hidden]` shows what you've read — this server or all servers, newest first, with linked titles and "how long ago" (◀ ▶ to page). It's only visible to you by default; set `hidden:no` to share it. History is stored **per person**, with each server's name saved at the time, so it survives the bot or you being kicked or banned from a server, and it also works in DMs (`!history` in a DM). `!history` in a server shows that server; `!history all` sends all servers to your DMs. Needs the Upstash storage to survive restarts.
+
+The read log (if `DISCORD_LOG_CHANNEL_ID` is set) now has a **📊 Bot stats** section: number of servers, their names, and total read requests.
+
 ## Queue
 `/read <url>` plays right away if nothing is playing, otherwise adds the link to the queue; links then play one after another without the bot leaving the channel. `/queue` shows it Jockie-style (page, `[mm:ss]`, linked titles, a "Make a selection" menu to play now / play next / remove, and you can also type `next page`, `previous page`, `go to page 3` or `cancel`). `/skip` skips the current link, `/previous` goes back, `/remove <n>`, `/clear`, and `/skipparagraph` skips just the paragraph. `/stop` clears everything.
 
