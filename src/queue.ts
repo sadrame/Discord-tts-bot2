@@ -20,6 +20,7 @@ import type {
 import { startReading, stopSession, getSession, getPrefs, getGuildVoice, setSessionFinishedHook } from "./voice.js";
 import { getBookmark } from "./bookmarks.js";
 import { withTimeout } from "./util.js";
+import { recordHistory } from "./history.js";
 import type { ChapterSection } from "./scraper.js";
 
 // A per-server queue of links. The first link plays right away; later ones wait and start by themselves
@@ -118,6 +119,9 @@ async function startItem(q: GuildQueue, item: QueueItem, resume: boolean, why: W
   if (item.sections.length > 1) {
     await say(q, `📑 Detected **${item.sections.length} sections** — use \`/chapter <n>\` or the ⬅️ ➡️ buttons to navigate.`);
   }
+
+  // Remember it for /history (stored per person, so it outlives any server the bot or the person is removed from)
+  void recordHistory(item.requestedBy.id, { u: item.url, t: item.title, g: q.guild.id, n: q.guild.name, at: Date.now() });
 
   console.log(`[queue] guild=${q.guild.id} starting "${item.title}" (${why}) resumeFrom=${resumeFrom}`);
   await startReading(

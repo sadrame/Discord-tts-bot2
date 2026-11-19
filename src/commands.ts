@@ -86,6 +86,13 @@ export const slashCommands = [
           { name: "Normal",                    value: "normal" },
           { name: "Strong (more dramatic)",    value: "strong" },
         )),
+  new SlashCommandBuilder()
+    .setName("history")
+    .setDescription("See what you've read — remembered even if you're removed from a server")
+    .addStringOption((o) =>
+      o.setName("scope").setDescription("Which servers to show (default: this server)")
+        .addChoices({ name: "This server", value: "guild" }, { name: "All servers", value: "all" }))
+    .addBooleanOption((o) => o.setName("hidden").setDescription("Only you can see it (default: yes)")),
   new SlashCommandBuilder().setName("chapters").setDescription("List detected chapters in the current reading"),
   new SlashCommandBuilder().setName("restart").setDescription("Restart from the beginning"),
   new SlashCommandBuilder()

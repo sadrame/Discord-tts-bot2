@@ -1,6 +1,8 @@
 import { createServer } from "http";
 import { createHash } from "crypto";
-import { kvGet, kvSet } from "./kv.js";
+import { kvGet, kvSet, kvIncr } from "./kv.js";
+import { getHistory, filterEntries, buildHistoryPayload, handleHistoryInteraction } from "./history.js";
+import type { HistoryScope } from "./history.js";
 import {
   Client,
   Events,
@@ -120,6 +122,7 @@ function helpLines(): string {
     "`/stop` — stop reading and leave voice (saves your position)",
     "`/pause` — pause playback",
     "`/resume` — resume playback",
+    "`/history [scope] [hidden]` — what you've read (this server or all servers, only you can see it by default). `!history` = this server, `!history all` = sent to your DMs",
     "`/queue [page]` — show the queue · `/read <url>` while something plays adds it to the queue",
     "`/skip` — skip the current link and play the next · `/previous` — go back a link",
     "`/skipparagraph` — skip to the next paragraph · `/remove <n>` · `/clear` — manage the queue",
@@ -209,7 +212,7 @@ async function pickVoiceChannel(
 
 // ─── Admin read log ───────────────────────────────────────────────────────────
 
-async function logRead(user: User, guild: Guild, sourceChannel: TextChannel, url: string, voiceLabel: string): Promise<void> {
+async function logRead(user: User, guild: Guild, sourceChannel: TextChannel, url: string, voiceLabel: string, counts: { total: number; server: number }): Promise<void> {
   const channelId = process.env["DISCORD_LOG_CHANNEL_ID"];
   if (!channelId) return;
   try {
@@ -240,7 +243,20 @@ async function logRead(user: User, guild: Guild, sourceChannel: TextChannel, url
         { name: "🔗 URL:",    value: url.slice(0, 1000) },
         { name: "🕐 Time:",   value: ts },
       );
-    await (ch as TextChannel).send({ embeds: [embed] });
+
+    // New section: how big the bot is
+    const guilds = [...client.guilds.cache.values()].sort((a, b) => b.memberCount - a.memberCount);
+    const names  = guilds.map((g) => `${g.name} (${g.memberCount.toLocaleString()})`).join(", ");
+    const nameText = names.length > 1000 ? `${names.slice(0, 985).replace(/, [^,]*$/, "")}, … and more` : names;
+    const stats = new EmbedBuilder()
+      .setColor(0x57f287)
+      .setTitle("📊 Bot stats")
+      .addFields(
+        { name: "🌐 Servers:",        value: String(guilds.length), inline: true },
+        { name: "📨 Read requests:",  value: counts.total > 0 ? `${counts.total.toLocaleString()} total · ${counts.server.toLocaleString()} from this server` : "—", inline: true },
+        { name: "🏠 Server list:",    value: nameText || "—" },
+      );
+    await (ch as TextChannel).send({ embeds: [embed, stats] });
   } catch { /* non-fatal — log channel may be unreachable */ }
 }
 
@@ -287,8 +303,9 @@ async function handleRead(
   catch (err) { await replyFn({ content: `❌ Could not read that page: ${(err as Error).message}` }); return; }
   log(`scraped ${chapter.paragraphs.length} paragraphs`);
 
-  // Log the request to the admin channel (fire-and-forget)
-  logRead(requestedBy, guild, textChannel, url, getGuildVoice(guildId).label).catch(() => {});
+  // Count it, and log the request to the admin channel (fire-and-forget)
+  const counts = await Promise.all([kvIncr("wct:stats:reads"), kvIncr(`wct:stats:reads:${guildId}`)]).then(([total, server]) => ({ total, server })).catch(() => ({ total: 0, server: 0 }));
+  logRead(requestedBy, guild, textChannel, url, getGuildVoice(guildId).label, counts).catch(() => {});
 
   const item: QueueItem = {
     url,
@@ -657,7 +674,20 @@ client.once(Events.ClientReady, async (c) => {
 
 // ─── Interaction handler (slash commands + buttons + select menus) ────────────
 
+async function runHistoryCommand(cmd: ChatInputCommandInteraction): Promise<void> {
+  const inServer = Boolean(cmd.guildId);
+  const scope: HistoryScope = inServer && cmd.options.getString("scope") !== "all" ? "guild" : "all";
+  const hidden = cmd.options.getBoolean("hidden") ?? true;
+  try { await cmd.deferReply(hidden || !inServer ? { flags: MessageFlags.Ephemeral } : {}); } catch { return; }
+  const entries = filterEntries(await getHistory(cmd.user.id), scope, cmd.guildId);
+  await cmd.editReply(buildHistoryPayload(entries, 1, { userId: cmd.user.id, scope, guildId: cmd.guildId })).catch(() => {});
+}
+
 client.on(Events.InteractionCreate, async (interaction: Interaction) => {
+  // History works everywhere — including DMs, so it's reachable even if you were removed from a server
+  if (interaction.isButton() && interaction.customId.startsWith("h_")) { await handleHistoryInteraction(interaction); return; }
+  if (interaction.isChatInputCommand() && interaction.commandName === "history") { await runHistoryCommand(interaction); return; }
+
   if (!interaction.guild) return;
   const guildId = interaction.guild.id;
 
@@ -905,6 +935,14 @@ client.on(Events.MessageCreate, async (message: Message) => {
       return;
     }
 
+    if (command === "history" || command === "hist") {
+      try {
+        const entries = filterEntries(await getHistory(message.author.id), "all", null);
+        await message.reply(buildHistoryPayload(entries, 1, { userId: message.author.id, scope: "all", guildId: null }));
+      } catch (err) { console.error("[dm history]", err); }
+      return;
+    }
+
     // Control commands — find the user's active session across all guilds
     const session = getSessionByUserId(message.author.id);
     if (!session) {
@@ -1010,6 +1048,19 @@ client.on(Events.MessageCreate, async (message: Message) => {
       }
       case "clear":    reply = clearQueue(guildId); break;
       case "controls": reply = await handleControls(guildId, member, args[0]?.toLowerCase() ?? null); break;
+      case "history": case "hist": {
+        const entries = await getHistory(message.author.id);
+        if (args[0]?.toLowerCase() === "all") {              // other servers' names are private → DM it
+          try {
+            await message.author.send(buildHistoryPayload(filterEntries(entries, "all", null), 1, { userId: message.author.id, scope: "all", guildId: null }));
+            reply = "📬 Sent your all-servers history to your DMs.";
+          } catch { reply = "❌ I couldn't DM you — open your DMs, or use `/history scope:All servers` (only you can see it)."; }
+          break;
+        }
+        try { await message.reply(buildHistoryPayload(filterEntries(entries, "guild", guildId), 1, { userId: message.author.id, scope: "guild", guildId })); }
+        catch (err) { console.error("[prefix history]", err); }
+        return;
+      }
       case "stop":     reply = await handleStop(guildId); break;
       case "pause":    reply = handlePause(guildId);      break;
       case "resume":   reply = handleResume(guildId);     break;

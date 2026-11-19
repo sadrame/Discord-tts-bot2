@@ -82,3 +82,44 @@ export async function kvDel(key: string): Promise<void> {
   const store = await loadFile();
   if (key in store) { delete store[key]; await saveFile(store); }
 }
+
+/** True when data survives restarts (Upstash). With the local-file fallback it is lost on every Render restart. */
+export function kvPersistent(): boolean { return USE_REDIS; }
+
+/** Add 1 to a counter and return the new value (0 if storage is unreachable). */
+export async function kvIncr(key: string): Promise<number> {
+  if (USE_REDIS) {
+    if (Date.now() < downUntil) return 0;
+    try { const r = await redis(["INCR", key]); return typeof r === "number" ? r : Number(r) || 0; }
+    catch (err) { markDown(err); return 0; }
+  }
+  const store = await loadFile();
+  const n = (parseInt(store[key] ?? "0", 10) || 0) + 1;
+  store[key] = String(n);
+  await saveFile(store);
+  return n;
+}
+
+/** Push a value onto the FRONT of a list, keeping at most `max` items (newest first). */
+export async function kvListPush(key: string, value: string, max: number): Promise<void> {
+  if (USE_REDIS) {
+    if (Date.now() < downUntil) return;
+    try { await redis(["LPUSH", key, value]); await redis(["LTRIM", key, 0, max - 1]); }
+    catch (err) { markDown(err); }
+    return;
+  }
+  const store = await loadFile();
+  const list: string[] = JSON.parse(store[key] ?? "[]");
+  list.unshift(value);
+  store[key] = JSON.stringify(list.slice(0, max));
+  await saveFile(store);
+}
+
+export async function kvListRange(key: string, max: number): Promise<string[]> {
+  if (USE_REDIS) {
+    if (Date.now() < downUntil) return [];
+    try { const r = await redis(["LRANGE", key, 0, max - 1]); return Array.isArray(r) ? r.map(String) : []; }
+    catch (err) { markDown(err); return []; }
+  }
+  return JSON.parse((await loadFile())[key] ?? "[]") as string[];
+}

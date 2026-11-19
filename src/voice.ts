@@ -248,6 +248,10 @@ async function connectToChannel(guild: Guild, voiceChannel: VoiceBasedChannel): 
     throw new Error(`Could not connect to the voice channel within ${Math.round(VOICE_READY_TIMEOUT_MS / 1000)} seconds.`);
   }
 
+  connection.on("stateChange", (oldState, newState) => {
+    if (oldState.status !== newState.status) console.log(`[voice] guild=${guild.id} connection ${oldState.status} → ${newState.status}`);
+  });
+
   // Standard recovery pattern: if Discord moves/reconnects us, give it a few seconds
   // before giving up. Only a real disconnect ends the session.
   connection.on(VoiceConnectionStatus.Disconnected, async () => {
@@ -403,6 +407,13 @@ export async function startReading(
 
   const player = createAudioPlayer({
     behaviors: { noSubscriber: NoSubscriberBehavior.Pause },
+  });
+
+  player.on("stateChange", (oldState, newState) => {
+    const odd = (st: string) => st === AudioPlayerStatus.AutoPaused || st === AudioPlayerStatus.Buffering;
+    if (oldState.status !== newState.status && (odd(newState.status) || odd(oldState.status))) {
+      console.warn(`[voice] guild=${guild.id} player ${oldState.status} → ${newState.status}`);
+    }
   });
 
   const voice = getGuildVoice(guild.id);
@@ -786,12 +797,14 @@ async function prepareOpus(file: string, speed: number): Promise<string | null> 
 // How much audio to keep generated ahead of what's playing. Paragraphs are often a single short line, so
 // looking ahead by ONE of them (the old behaviour) left only a couple of seconds to absorb any delay —
 // with several servers reading at once that showed up as long pauses.
-const PREFETCH_SECONDS    = Math.max(2, Number(process.env["PREFETCH_SECONDS"]) || 20);
-const PREFETCH_MAX_CHUNKS = 8;
+const PREFETCH_SECONDS    = Math.max(2, Number(process.env["PREFETCH_SECONDS"]) || 40);
+const PREFETCH_MAX_CHUNKS = 14;
 
 async function runPipeline(session: ReadSession): Promise<void> {
   const queue: ChunkResult[] = [];      // generated + encoded, waiting to play (in order)
   let producing = false;
+  let waitingSince: number | null = null;   // when the listener started waiting for audio (for diagnostics)
+  let warnedWait = false;
 
   const bufferedSeconds = (): number =>
     queue.reduce((sum, c) => sum + chunkSeconds(session.allChunks[c.chunkIdx] ?? "", session.speed), 0);
@@ -802,8 +815,11 @@ async function runPipeline(session: ReadSession): Promise<void> {
     producing = true;
     try {
       while (!session.stopped && !session.paused && queue.length < PREFETCH_MAX_CHUNKS && bufferedSeconds() < PREFETCH_SECONDS) {
+        const startedAt = Date.now();
         const chunk = await generateChunk(session);
         if (!chunk) break;
+        const took = (Date.now() - startedAt) / 1000;
+        if (took > 8) console.warn(`[pipeline] guild=${session.guildId} slow audio: chunk ${chunk.chunkIdx} took ${took.toFixed(1)}s to prepare (queued ahead: ${queue.length})`);
         if (session.stopped || chunk.epoch !== session.seekEpoch) { await discardResult(chunk); continue; }
         queue.push(chunk);
       }
@@ -834,7 +850,17 @@ async function runPipeline(session: ReadSession): Promise<void> {
 
       void produce();
       const current = queue.shift();
-      if (!current) { await sleep(50); continue; }                                 // still generating
+      if (!current) {                                                              // still generating
+        waitingSince ??= Date.now();
+        if (!warnedWait && Date.now() - waitingSince > 3_000) {
+          warnedWait = true;
+          console.warn(`[pipeline] guild=${session.guildId} waiting for audio — nothing ready (generator busy: ${producing}, next chunk ${session.chunkIndex}/${session.allChunks.length})`);
+        }
+        await sleep(50);
+        continue;
+      }
+      if (waitingSince !== null && warnedWait) console.warn(`[pipeline] guild=${session.guildId} audio resumed after ${((Date.now() - waitingSince) / 1000).toFixed(1)}s wait`);
+      waitingSince = null; warnedWait = false;
 
       session.playingIdx = current.chunkIdx;
       rebaseClock(session, current.chunkIdx);          // re-anchor the clock at every clip so estimates can't drift

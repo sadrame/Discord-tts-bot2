@@ -6,15 +6,15 @@ import { randomUUID } from "crypto";
 import type { VoiceOption } from "./voices.js";
 import { DEFAULT_VOICE } from "./voices.js";
 import { elevenSynthesize, ElevenError } from "./eleven.js";
-import { expressiveBody } from "./expressive.js";
+import { expressiveRuns } from "./expressive.js";
 import { splitLanguages, japaneseVoiceId } from "./lang.js";
-import type { ExpressionLevel } from "./expressive.js";
+import type { ExpressionLevel, Prosody } from "./expressive.js";
 import { splitWithSfx, softenShouting, getSfxFile, FALLBACK_SPEECH, SFX_ENABLED } from "./sfx.js";
 import type { Segment } from "./sfx.js";
 import { concatAudio, silenceFile } from "./media.js";
 import type { AudioPart } from "./media.js";
 
-const TIMEOUT_MS = 30_000;
+const TIMEOUT_MS = 20_000;          // upper limit for one request; normal ones take 1–5 s
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
@@ -83,7 +83,7 @@ function releaseTts(): void {
 
 // ─── Low-level synthesis ──────────────────────────────────────────────────────
 
-async function synthesize(text: string, voiceId: string, filePath: string, rawSsml = false): Promise<void> {
+async function synthesize(text: string, voiceId: string, filePath: string, prosody?: Prosody, timeoutMs = TIMEOUT_MS): Promise<void> {
   const pooled = await checkoutEngine(voiceId);
   let ok = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -91,8 +91,8 @@ async function synthesize(text: string, voiceId: string, filePath: string, rawSs
     await Promise.race([
       new Promise<void>((resolve, reject) => {
         // The Edge API takes SSML, so & < > in the text must be escaped
-        const safe = rawSsml ? text : text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-        const { audioStream } = pooled.engine.toStream(safe);
+        const safe = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+        const { audioStream } = pooled.engine.toStream(safe, prosody);
         const chunks: Buffer[] = [];
         audioStream.on("data", (c: Buffer) => chunks.push(c));
         audioStream.on("end", async () => {
@@ -106,7 +106,7 @@ async function synthesize(text: string, voiceId: string, filePath: string, rawSs
         audioStream.on("error", reject);
       }),
       new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`TTS timed out after ${TIMEOUT_MS}ms`)), TIMEOUT_MS);
+        timer = setTimeout(() => reject(new Error(`TTS timed out after ${timeoutMs}ms`)), timeoutMs);
       }),
     ]);
     ok = true;
@@ -118,37 +118,63 @@ async function synthesize(text: string, voiceId: string, filePath: string, rawSs
 
 // ─── Bing / Edge synthesis (caller must hold the semaphore) ──────────────────
 
-// If the Bing service rejects expressive (SSML) requests, stop sending them for a while and read plain text instead
+// If styled requests keep failing, read plain text for a while instead of wasting connections on them
 let ssmlFailures = 0;
 let ssmlPausedUntil = 0;
 const ssmlAllowed = (): boolean => Date.now() >= ssmlPausedUntil && (process.env["EXPRESSION"] ?? "on").toLowerCase() !== "off";
 
+/** Short texts should finish in a couple of seconds; give long ones more time, but never the full limit for short ones. */
+const timeoutFor = (chars: number): number => Math.min(TIMEOUT_MS, Math.max(10_000, 8_000 + chars * 40));
+
+/** One request → one mp3 file. */
+async function synthToFile(text: string, voiceId: string, prosody?: Prosody): Promise<string> {
+  const filePath = join(tmpdir(), `wct-tts-${randomUUID()}.mp3`);
+  try {
+    await synthesize(text, voiceId, filePath, prosody, timeoutFor(text.length));
+    return filePath;
+  } catch (err) {
+    await unlink(filePath).catch(() => {});
+    throw err;
+  }
+}
+
 async function edgeToFile(raw: string, voice: VoiceOption, level: ExpressionLevel = "off"): Promise<string> {
   const plain = sanitizeText(softenShouting(raw));
-  let body: string | null = ssmlAllowed() ? expressiveBody(sanitizeText(raw), level) : null;
+  let runs = ssmlAllowed() ? expressiveRuns(sanitizeText(raw), level) : null;
   let lastErr: Error = new Error("Unknown TTS error");
 
   for (let attempt = 1; attempt <= 3; attempt++) {
-    const filePath = join(tmpdir(), `wct-tts-${randomUUID()}.mp3`);
     try {
-      console.log(`[tts] voice=${voice.id} attempt=${attempt} len=${plain.length}${body ? " expressive" : ""}`);
-      await synthesize(body ?? plain, voice.id, filePath, body !== null);
-      if (body !== null) ssmlFailures = 0;
-      return filePath; // ✅
+      console.log(`[tts] voice=${voice.id} attempt=${attempt} len=${plain.length}${runs ? ` expressive(${runs.length})` : ""}`);
+      let out: string;
+      if (!runs) {
+        out = await synthToFile(plain, voice.id);
+      } else {
+        const files: string[] = [];
+        try {
+          for (const r of runs) files.push(await synthToFile(softenShouting(r.text), voice.id, r.prosody ?? undefined));
+        } catch (e) { await Promise.all(files.map((f) => cleanupFile(f))); throw e; }
+        if (files.length === 1) out = files[0]!;
+        else {
+          try { out = await concatAudio(files.map((file) => ({ file }))); }
+          finally { await Promise.all(files.map((f) => cleanupFile(f))); }
+        }
+        ssmlFailures = 0;
+      }
+      return out; // ✅
     } catch (err) {
       lastErr = err as Error;
-      await unlink(filePath).catch(() => {});
-      // (the failed connection was already dropped; the next attempt gets a fresh one)
+      // (a failed connection was already dropped; the next attempt gets a fresh one)
       console.warn(`[tts] attempt ${attempt}/3 failed (${voice.id}): ${lastErr.message}`);
-      if (body !== null) {
-        body = null;                                   // retry this one as plain text
-        if (++ssmlFailures >= 3) {
+      if (runs) {
+        runs = null;                                     // retry this one as plain text
+        if (++ssmlFailures >= 2) {
           ssmlFailures = 0;
-          ssmlPausedUntil = Date.now() + 10 * 60_000;
-          console.warn("[tts] expressive requests keep failing — reading plain text for 10 minutes");
+          ssmlPausedUntil = Date.now() + 15 * 60_000;
+          console.warn("[tts] expressive requests keep failing — reading plain text for 15 minutes");
         }
       }
-      if (attempt < 3) await sleep(700);
+      if (attempt < 3) await sleep(300);
     }
   }
   throw lastErr;
