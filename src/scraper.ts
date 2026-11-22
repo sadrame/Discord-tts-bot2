@@ -169,6 +169,87 @@ function extractParagraphs(
   return { paragraphs, sections };
 }
 
+// ─── Fetching pages (browser-like, with backup routes when a site refuses this server) ──────────
+
+const READER_BASE  = process.env["READER_BASE"]  ?? "https://r.jina.ai/";                 // a page-reader service
+const WAYBACK_BASE = process.env["WAYBACK_BASE"] ?? "https://web.archive.org/web/2id_/";   // the Internet Archive's saved copy
+const CHROME_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
+// What a real browser sends. Sites like AO3 reject bare, bot-looking requests with 403.
+const BROWSER_HEADERS: Record<string, string> = {
+  "User-Agent":                CHROME_UA,
+  Accept:                      "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+  "Accept-Language":           "en-US,en;q=0.9",
+  "Accept-Encoding":           "gzip, deflate, br",
+  "Upgrade-Insecure-Requests": "1",
+  "Sec-Fetch-Dest":            "document",
+  "Sec-Fetch-Mode":            "navigate",
+  "Sec-Fetch-Site":            "none",
+  "Sec-Fetch-User":            "?1",
+  "Sec-Ch-Ua":                 '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+  "Sec-Ch-Ua-Mobile":          "?0",
+  "Sec-Ch-Ua-Platform":        '"Windows"',
+  "Cache-Control":             "max-age=0",
+};
+
+interface Fetched { status: number; html: string; retryAfter: number | null }
+
+async function getOnce(url: string, headers: Record<string, string>, timeout: number): Promise<Fetched> {
+  try {
+    const res = await axios.get<string>(url, {
+      headers, timeout, responseType: "text", transformResponse: (d) => d, maxRedirects: 5, validateStatus: () => true,
+    });
+    const ra = parseInt(String(res.headers["retry-after"] ?? ""), 10);
+    return { status: res.status, html: typeof res.data === "string" ? res.data : String(res.data ?? ""), retryAfter: Number.isFinite(ra) ? ra : null };
+  } catch {
+    return { status: 0, html: "", retryAfter: null };           // network error or timeout
+  }
+}
+
+const CHALLENGE = /just a moment|cf-chl|attention required|enable javascript and cookies|checking your browser|verify you are human|access denied|retry later|rate limit/i;
+const looksBlocked = (html: string): boolean => html.length < 6000 && CHALLENGE.test(html);       // real chapter pages are much bigger
+const hasContent = (html: string, ao3: boolean): boolean =>
+  ao3 ? /userstuff|id="workskin"|class="chapter/i.test(html) : html.length > 1500 && !looksBlocked(html);
+
+export async function fetchPageHtml(url: string, opts: { ao3?: boolean; extraHeaders?: Record<string, string> } = {}): Promise<string> {
+  const ao3 = opts.ao3 === true;
+  const [base = url, hash = ""] = url.split("#");
+  // AO3 puts adult works behind a click-through page unless this flag is set
+  const target = ao3 && !/[?&]view_adult=/.test(base) ? `${base}${base.includes("?") ? "&" : "?"}view_adult=true${hash ? `#${hash}` : ""}` : url;
+
+  let res = await getOnce(target, { ...BROWSER_HEADERS, ...(opts.extraHeaders ?? {}) }, 12_000);
+  if ([429, 502, 503, 504].includes(res.status)) {                // busy or rate-limited: wait a moment and try once more
+    await new Promise((r) => setTimeout(r, Math.min(5_000, (res.retryAfter ?? 2) * 1000)));
+    res = await getOnce(target, { ...BROWSER_HEADERS, ...(opts.extraHeaders ?? {}) }, 12_000);
+  }
+  if (res.status === 200 && hasContent(res.html, ao3)) return res.html;
+
+  // The site is refusing this server — try the backup routes
+  const host  = new URL(url).hostname.replace("www.", "");
+  const notes = [`direct: ${res.status ? `HTTP ${res.status}` : "no answer"}`];
+  const backups: Array<[string, string, Record<string, string>]> = [
+    ["page reader",  `${READER_BASE}${target}`,  { "X-Return-Format": "html", Accept: "text/html", "User-Agent": CHROME_UA }],
+    ["web archive",  `${WAYBACK_BASE}${url}`,    { "User-Agent": CHROME_UA }],
+  ];
+  for (const [name, backupUrl, headers] of backups) {
+    const r = await getOnce(backupUrl, headers, 20_000);
+    if (r.status === 200 && hasContent(r.html, ao3)) {
+      console.log(`[scrape] ${host}: direct request failed (${notes[0]}) — loaded it through the ${name} instead`);
+      return r.html;
+    }
+    notes.push(`${name}: ${r.status ? `HTTP ${r.status}` : "no answer"}`);
+  }
+
+  const status = res.status || "no answer";
+  throw new Error(
+    (ao3
+      ? `AO3 is refusing requests from this server (${status}) and the backup routes couldn't load it either. `
+      : `${host} refused the request (${status}) and the backup routes couldn't load it either. `) +
+    `This usually clears up on its own — try again in a few minutes, and make sure the link is public. (${notes.join("; ")})`
+  );
+}
+
 function extraConfig(hostname: string): { headers?: Record<string, string>; params?: Record<string, string> } {
   if (hostname === "archiveofourown.org") {
     return {
@@ -301,16 +382,7 @@ export async function scrapeChapter(url: string): Promise<ScrapedChapter> {
   const hostname = new URL(url).hostname.replace("www.", "");
   const extra    = extraConfig(hostname);
 
-  const { data: html } = await axios.get(url, {
-    headers: {
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-      Accept: "text/html,application/xhtml+xml",
-      ...extra.headers,
-    },
-    timeout: 15000,
-  });
+  const html = await fetchPageHtml(url, { ao3: hostname === "archiveofourown.org", ...(extra.headers ? { extraHeaders: extra.headers } : {}) });
 
   const $ = cheerio.load(html);
 

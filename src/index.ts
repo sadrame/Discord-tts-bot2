@@ -299,7 +299,7 @@ async function handleRead(
 
   const isFile = /\.(pdf|txt)(#.*)?$/i.test(url);
   let chapter;
-  try { chapter = await withTimeout(scrapeChapter(url), isFile ? 180_000 : 45_000, "Fetching that link"); }
+  try { chapter = await withTimeout(scrapeChapter(url), isFile ? 180_000 : 80_000, "Fetching that link"); }
   catch (err) { await replyFn({ content: `❌ Could not read that page: ${(err as Error).message}` }); return; }
   log(`scraped ${chapter.paragraphs.length} paragraphs`);
 
