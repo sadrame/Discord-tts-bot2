@@ -33,6 +33,14 @@ The read log (if `DISCORD_LOG_CHANNEL_ID` is set) now has a **📊 Bot stats** s
 ## Japanese
 Japanese text (kana/kanji) inside a chapter is read aloud in Japanese by a Japanese Bing voice matching the current voice's gender — not translated. ElevenLabs voices read Japanese themselves.
 
+## Turkish
+
+[#turkish](#turkish)
+
+Turkish text is detected automatically and read aloud in Turkish by a Turkish Bing voice matching the current voice's gender (Emel for female, Ahmet for male) — not read with English pronunciation and not translated. Pages from the hosts in `TURKISH_HOSTS` (default `rezeroturkce.com`) are always read in Turkish; anywhere else it's detected per paragraph from Turkish letters and common words, so Turkish, English and Japanese can be mixed. ElevenLabs voices read Turkish themselves.
+
+If a Turkish site won't load for the bot, paste the chapter into a public Google Doc ("Anyone with the link") and `/read` that link.
+
 ## Images
 A picture on the page is announced as "Image file." (no sound or marker). Emoji, icons and avatars are ignored.
 
@@ -71,6 +79,7 @@ Positions are saved per person per chapter (autosaved while you listen and on sh
 | `ELEVENLABS_API_KEY` | optional — enables ElevenLabs and Reader voices |
 | `ELEVENLABS_MODEL` | optional — default `eleven_flash_v2_5` (their cheaper, fast model) |
 | `ELEVENLABS_BASE_URL` | optional — e.g. `https://api.eu.residency.elevenlabs.io` for EU data residency |
+| `TURKISH_HOSTS`                                       | optional — comma-separated sites always read in Turkish (default `rezeroturkce.com`)           |
 | `SFX` | `off` turns the Bing reaction sounds off (default on) |
 | `SFX_ELEVENLABS` | `1` = generate missing reaction sounds with ElevenLabs (needs `ELEVENLABS_API_KEY`) |
 | `SOUNDS_DIR` | folder for your own reaction sounds (default `./sounds`) |
