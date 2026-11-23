@@ -21,6 +21,7 @@ import {
   ButtonStyle,
   EmbedBuilder,
 } from "discord.js";
+import { isTurkishSite } from "./lang.js";
 import { textToMp3File, cleanupFile, splitIntoChunks, warmUpVoice } from "./tts.js";
 import type { VoiceOption } from "./voices.js";
 import { DEFAULT_VOICE, voiceDisplay } from "./voices.js";
@@ -948,7 +949,7 @@ async function generateChunk(session: ReadSession): Promise<ChunkResult | null> 
         const marker = parseMarkerChunk(text);
         const file   = marker
           ? await markerToFile(marker, getPrefs(session.guildId).markers, voice)
-          : await textToMp3File(text, voice, { expression: getPrefs(session.guildId).expression });
+          : await textToMp3File(text, voice, { expression: getPrefs(session.guildId).expression, turkish: isTurkishSite(session.url) });
 
         // Encode for playback now, while the previous clip is still playing
         const speed    = session.speed;

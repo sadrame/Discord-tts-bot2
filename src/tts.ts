@@ -7,7 +7,7 @@ import type { VoiceOption } from "./voices.js";
 import { DEFAULT_VOICE } from "./voices.js";
 import { elevenSynthesize, ElevenError } from "./eleven.js";
 import { expressiveRuns } from "./expressive.js";
-import { splitLanguages, japaneseVoiceId } from "./lang.js";
+import { splitLanguages, japaneseVoiceId, isTurkish, turkishVoiceId } from "./lang.js";
 import type { ExpressionLevel, Prosody } from "./expressive.js";
 import { splitWithSfx, softenShouting, getSfxFile, FALLBACK_SPEECH, SFX_ENABLED } from "./sfx.js";
 import type { Segment } from "./sfx.js";
@@ -181,16 +181,19 @@ async function edgeToFile(raw: string, voice: VoiceOption, level: ExpressionLeve
 }
 
 /** Speak text that may mix English and Japanese: each language goes to a voice that can read it. */
-async function edgeSpeak(raw: string, voice: VoiceOption, level: ExpressionLevel = "off"): Promise<string> {
+async function edgeSpeak(raw: string, voice: VoiceOption, level: ExpressionLevel = "off", turkish = false): Promise<string> {
   const segments = splitLanguages(raw);
-  if (segments.length <= 1 && !segments[0]?.ja) return edgeToFile(raw, voice, level);
+  const trVoice: VoiceOption = { ...voice, id: turkishVoiceId(voice.gender), service: "edge" };
+  // Turkish text (or a Turkish site) → a Turkish voice, so it isn't read with English pronunciation
+  const voiceFor = (text: string): VoiceOption => (turkish || isTurkish(text) ? trVoice : voice);
+  if (segments.length <= 1 && !segments[0]?.ja) return edgeToFile(raw, voiceFor(raw), level);
 
   const jaVoice: VoiceOption = { ...voice, id: japaneseVoiceId(voice.gender), service: "edge" };
   const files: string[] = [];
   try {
     for (const seg of segments) {
       if (!/[\p{L}\p{N}]/u.test(seg.text)) continue;
-      files.push(await edgeToFile(seg.text, seg.ja ? jaVoice : voice, seg.ja ? "off" : level));
+      files.push(await edgeToFile(seg.text, seg.ja ? jaVoice : voiceFor(seg.text), seg.ja ? "off" : level));
     }
     if (files.length === 0) return await silenceFile(0.15);
     if (files.length === 1) { const only = files[0]!; files.length = 0; return only; }
@@ -204,14 +207,14 @@ async function edgeSpeak(raw: string, voice: VoiceOption, level: ExpressionLevel
 }
 
 /** Speak the text parts, drop in sound clips for the reactions, and stitch it all into one mp3. */
-async function edgeWithSfx(segments: Segment[], plainText: string, voice: VoiceOption, level: ExpressionLevel = "off"): Promise<string> {
+async function edgeWithSfx(segments: Segment[], plainText: string, voice: VoiceOption, level: ExpressionLevel = "off", turkish = false): Promise<string> {
   const parts: AudioPart[] = [];
   const temps: string[]    = [];
   try {
     for (const seg of segments) {
       if (seg.type === "text") {
         if (!/[\p{L}\p{N}]/u.test(seg.text)) continue;
-        const f = await edgeSpeak(seg.text, voice, level);
+        const f = await edgeSpeak(seg.text, voice, level, turkish);
         temps.push(f); parts.push({ file: f });
         continue;
       }
@@ -236,7 +239,7 @@ async function edgeWithSfx(segments: Segment[], plainText: string, voice: VoiceO
       return await concatAudio(parts);
     } catch (err) {
       console.warn(`[tts] couldn't mix sound effects (${(err as Error).message}) — reading the text instead`);
-      return await edgeSpeak(plainText, voice, level);
+      return await edgeSpeak(plainText, voice, level, turkish);
     }
   } finally {
     await Promise.all(temps.map((f) => cleanupFile(f)));
@@ -254,7 +257,7 @@ async function edgeWithSfx(segments: Segment[], plainText: string, voice: VoiceO
 export async function textToMp3File(
   text: string,
   voice: VoiceOption = DEFAULT_VOICE,
-  opts: { expression?: ExpressionLevel } = {},
+  opts: { expression?: ExpressionLevel; turkish?: boolean } = {},
 ): Promise<string> {
   const level: ExpressionLevel = opts.expression ?? "off";
   const clean = sanitizeText(text);
@@ -288,9 +291,9 @@ export async function textToMp3File(
     // ── Bing / Edge voices (with reactions: screams, screeches, scratches…) ──
     const segments: Segment[] = SFX_ENABLED ? splitWithSfx(clean) : [{ type: "text", text: clean }];
     if (segments.length === 1 && segments[0]!.type === "text") {
-      return await edgeSpeak(clean, voice, level);
+      return await edgeSpeak(clean, voice, level, opts.turkish === true);
     }
-    return await edgeWithSfx(segments, clean, voice, level);
+    return await edgeWithSfx(segments, clean, voice, level, opts.turkish === true);
   } finally {
     releaseTts();
   }

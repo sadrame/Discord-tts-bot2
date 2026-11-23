@@ -36,12 +36,12 @@ function sentenceStyle(sentence: string, m: number): Style {
   const question = punct.includes("?");
   const trailing = /(\.{3,}|…)["'”’)\]]*$/.test(text);
 
-  const words     = text.match(/[A-Za-z][A-Za-z'’]*/g) ?? [];
-  const letters   = text.replace(/[^A-Za-z]/g, "");
-  const upper     = letters.replace(/[^A-Z]/g, "").length;
+  const words     = text.match(/[A-Za-zÇĞİÖŞÜçğıöşü][A-Za-zÇĞİÖŞÜçğıöşü'’]*/g) ?? [];
+  const letters   = text.replace(/[^A-Za-zÇĞİÖŞÜçğıöşü]/g, "");
+  const upper     = letters.replace(/[^A-ZÇĞİÖŞÜ]/g, "").length;
   const allCaps   = letters.length >= 4 && words.length >= 2 && upper / letters.length >= 0.9;
   const capsWords = words.filter((w) => w.length >= 2 && w === w.toUpperCase() && !ACRONYMS.has(w) && !/^[IVXLCDM]{2,5}$/.test(w)).length;
-  const stretched = words.some((w) => /([A-Za-z])\1{2,}/.test(w));
+  const stretched = words.some((w) => /([A-Za-zÇĞİÖŞÜçğıöşü])\1{2,}/.test(w));
 
   if (bangs > 0)  { s.volume += 14 * m; s.pitch += 3 * m; s.rate += 4 * m; }
   if (bangs > 1)  { s.volume += 10 * m; }
